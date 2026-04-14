@@ -84,6 +84,14 @@ const SCHEMA = {
     defaultFactory: () => ({}),
     normalize: normalizeThemeOverrides,
   },
+  // Phase 3b-swap: per-theme variant selection (e.g. {clawd: "chill", calico: "default"}).
+  // Missing key for a theme = use that theme's `default` variant. Unknown variantIds
+  // get lenient-fallback to default at load time (see theme-loader._resolveVariant).
+  themeVariant: {
+    type: "object",
+    defaultFactory: () => ({}),
+    normalize: normalizeThemeVariant,
+  },
 };
 
 const SCHEMA_KEYS = Object.freeze(Object.keys(SCHEMA));
@@ -212,6 +220,18 @@ function normalizeThemeOverrides(value, defaultsValue) {
     if (Object.keys(cleanThemeMap).length > 0) {
       out[themeId] = cleanThemeMap;
     }
+  }
+  return out;
+}
+
+function normalizeThemeVariant(value, defaultsValue) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return defaultsValue;
+  const out = {};
+  for (const themeId of Object.keys(value)) {
+    const variantId = value[themeId];
+    if (typeof themeId !== "string" || !themeId) continue;
+    if (typeof variantId !== "string" || !variantId) continue;
+    out[themeId] = variantId;
   }
   return out;
 }

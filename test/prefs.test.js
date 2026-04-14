@@ -152,6 +152,32 @@ describe("prefs.validate", () => {
     assert.deepStrictEqual(a, d);
     assert.deepStrictEqual(b, d);
   });
+
+  // Phase 3b-swap: themeVariant field
+  it("themeVariant defaults to empty object (no migration needed)", () => {
+    const d = prefs.getDefaults();
+    assert.deepStrictEqual(d.themeVariant, {});
+  });
+
+  it("themeVariant drops malformed entries but keeps string/string pairs", () => {
+    const v = prefs.validate({
+      themeVariant: {
+        clawd: "chill",
+        calico: "default",
+        bogus: 42,           // wrong value type
+        "": "chill",         // empty themeId
+        nullVal: "",         // empty variantId
+      },
+    });
+    assert.deepStrictEqual(v.themeVariant, { clawd: "chill", calico: "default" });
+  });
+
+  it("themeVariant falls back to defaults when not an object", () => {
+    const v = prefs.validate({ themeVariant: "nope" });
+    assert.deepStrictEqual(v.themeVariant, {});
+    const w = prefs.validate({ themeVariant: [1, 2] });
+    assert.deepStrictEqual(w.themeVariant, {});
+  });
 });
 
 describe("prefs.migrate", () => {

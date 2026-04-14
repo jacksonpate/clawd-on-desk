@@ -64,6 +64,7 @@ const STRINGS = {
     themeActiveIndicator: "\u2713 Active",
     themeThumbMissing: "\u{1F3AD}",
     themeDeleteLabel: "Delete theme",
+    themeVariantStripLabel: "Variants",
     toastThemeDeleted: "Theme deleted.",
     toastThemeDeleteFailed: "Couldn't delete theme: ",
     animMapTitle: "Animation Map",
@@ -131,6 +132,7 @@ const STRINGS = {
     themeActiveIndicator: "\u2713 当前",
     themeThumbMissing: "\u{1F3AD}",
     themeDeleteLabel: "删除主题",
+    themeVariantStripLabel: "变体",
     toastThemeDeleted: "主题已删除。",
     toastThemeDeleteFailed: "删除主题失败：",
     animMapTitle: "动画映射",
@@ -377,8 +379,111 @@ function renderThemeTab(parent) {
 
   const grid = document.createElement("div");
   grid.className = "theme-grid";
-  for (const theme of themeList) grid.appendChild(buildThemeCard(theme));
+
+  // Phase 3b-swap: when the active theme has ≥2 variants, wrap its card +
+  // variant strip in a "spotlight" block that spans the full grid row. Keeps
+  // the strip visually attached to the active card instead of floating below
+  // the entire grid.
+  const active = themeList.find((x) => x.active);
+  const activeHasVariants = active && Array.isArray(active.variants) && active.variants.length > 1;
+
+  for (const theme of themeList) {
+    if (theme === active && activeHasVariants) {
+      const spotlight = document.createElement("div");
+      spotlight.className = "theme-spotlight";
+      spotlight.appendChild(buildThemeCard(theme));
+      spotlight.appendChild(buildVariantStrip(theme));
+      grid.appendChild(spotlight);
+    } else {
+      grid.appendChild(buildThemeCard(theme));
+    }
+  }
   parent.appendChild(grid);
+}
+
+// Resolve an `{en, zh}` object or a plain string to a localized string.
+// Falls back across languages before giving up.
+function localizeField(value) {
+  if (value == null) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "object") {
+    const lang = (snapshot && snapshot.lang) || "en";
+    if (value[lang]) return value[lang];
+    if (value.en) return value.en;
+    if (value.zh) return value.zh;
+    const firstKey = Object.keys(value)[0];
+    if (firstKey) return value[firstKey];
+  }
+  return "";
+}
+
+function buildVariantStrip(theme) {
+  const wrap = document.createElement("div");
+  wrap.className = "theme-variant-strip";
+
+  const label = document.createElement("div");
+  label.className = "theme-variant-strip-label";
+  label.textContent = t("themeVariantStripLabel");
+  wrap.appendChild(label);
+
+  const row = document.createElement("div");
+  row.className = "theme-variant-row";
+
+  const currentVariantId = (snapshot && snapshot.themeVariant && snapshot.themeVariant[theme.id])
+    || "default";
+
+  for (const variant of theme.variants) {
+    row.appendChild(buildVariantCard(theme.id, variant, currentVariantId));
+  }
+  wrap.appendChild(row);
+  return wrap;
+}
+
+function buildVariantCard(themeId, variant, currentVariantId) {
+  const card = document.createElement("div");
+  card.className = "theme-variant-card";
+  card.setAttribute("role", "radio");
+  card.setAttribute("tabindex", "0");
+  const isActive = variant.id === currentVariantId;
+  card.setAttribute("aria-checked", isActive ? "true" : "false");
+  if (isActive) card.classList.add("active");
+
+  const thumb = document.createElement("div");
+  thumb.className = "theme-variant-thumb";
+  if (variant.previewFileUrl) {
+    const img = document.createElement("img");
+    img.src = variant.previewFileUrl;
+    img.alt = "";
+    img.draggable = false;
+    thumb.appendChild(img);
+  } else {
+    const glyph = document.createElement("span");
+    glyph.className = "theme-variant-thumb-empty";
+    glyph.textContent = t("themeThumbMissing");
+    thumb.appendChild(glyph);
+  }
+  card.appendChild(thumb);
+
+  const name = document.createElement("div");
+  name.className = "theme-variant-name";
+  name.textContent = localizeField(variant.name) || variant.id;
+  card.appendChild(name);
+
+  const descText = localizeField(variant.description);
+  if (descText) {
+    const desc = document.createElement("div");
+    desc.className = "theme-variant-desc";
+    desc.textContent = descText;
+    desc.title = descText;
+    card.appendChild(desc);
+  }
+
+  if (!isActive) {
+    attachActivation(card, () =>
+      window.settingsAPI.command("setThemeSelection", { themeId, variantId: variant.id })
+    );
+  }
+  return card;
 }
 
 function buildThemeCard(theme) {
@@ -444,7 +549,10 @@ function buildThemeCard(theme) {
   }
 
   if (!theme.active) {
-    attachActivation(card, () => window.settingsAPI.update("theme", theme.id));
+    // Phase 3b-swap: theme switches go through setThemeSelection so the
+    // stored themeVariant[themeId] is honoured (or self-healed on dead ids).
+    // applyUpdate("theme", id) would bypass the variant-resolution path.
+    attachActivation(card, () => window.settingsAPI.command("setThemeSelection", { themeId: theme.id }));
   }
   return card;
 }
@@ -795,6 +903,10 @@ window.settingsAPI.onChanged((payload) => {
   if (changes && "theme" in changes && themeList) {
     themeList = themeList.map((t) => ({ ...t, active: t.id === changes.theme }));
   }
+  // Phase 3b-swap: themeVariant changes (e.g. after setThemeSelection command)
+  // need to re-render so the variant strip highlights the newly-active card.
+  // The list itself is unchanged — variants live on each theme entry — so no
+  // fetch is needed, just a re-render under the current active theme.
   renderSidebar();
   renderContent();
 });

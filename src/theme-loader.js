@@ -58,6 +58,27 @@ const DEFAULT_EYE_TRACKING = {
 
 const REQUIRED_STATES = ["idle", "working", "thinking", "sleeping", "waking"];
 
+// ── Variant support (Phase 3b-swap) ──
+// Allow-list of fields a variant may override. Anything else → ignored + warned
+// (see docs/plan-settings-panel-3b-swap.md §6.4 Validator Spec rule 1).
+const VARIANT_ALLOWED_KEYS = new Set([
+  // Metadata (not merged into runtime theme)
+  "name", "description", "preview",
+  // Runtime fields (see §6.1 allow-list table)
+  "workingTiers", "jugglingTiers", "idleAnimations",
+  "wideHitboxFiles", "sleepingHitboxFiles",
+  "hitBoxes", "timings", "transitions",
+  "objectScale", "displayHintMap",
+]);
+// Fields that replace wholesale instead of deep-merge.
+// Arrays always replace; `displayHintMap` is explicitly replace per §6.1
+// (deep-merge can't express "remove a hint").
+const VARIANT_REPLACE_FIELDS = new Set([
+  "workingTiers", "jugglingTiers", "idleAnimations",
+  "wideHitboxFiles", "sleepingHitboxFiles",
+  "displayHintMap",
+]);
+
 // ── SVG sanitization config ──
 const DANGEROUS_TAGS = new Set([
   "script", "foreignobject", "iframe", "embed", "object", "applet",
@@ -140,14 +161,18 @@ function _scanThemesDir(dir, builtin, themes, seen) {
  *
  * Strict mode throws on missing/invalid; lenient falls back to "clawd".
  * Callers detect fallback by comparing the requested id against
- * `returnedTheme._id` — no synthetic flag needed.
+ * `returnedTheme._id` / `returnedTheme._variantId` — no synthetic flag needed.
+ *
+ * Unknown variant ids always fall back to "default" (even in strict mode) —
+ * a missing variant is a UX concern, not a theme-breaking condition.
  *
  * @param {string} themeId
- * @param {{ strict?: boolean }} [opts]
+ * @param {{ strict?: boolean, variant?: string }} [opts]
  * @returns {object} merged theme config
  */
 function loadTheme(themeId, opts = {}) {
   const strict = !!opts.strict;
+  const requestedVariant = typeof opts.variant === "string" && opts.variant ? opts.variant : "default";
   const { raw, isBuiltin, themeDir } = _readThemeJson(themeId);
 
   if (!raw) {
@@ -166,9 +191,16 @@ function loadTheme(themeId, opts = {}) {
     if (themeId !== "clawd") return loadTheme("clawd");
   }
 
+  // Resolve variant + apply patch BEFORE mergeDefaults so that geometry
+  // derivation (imgWidthRatio/imgOffsetX/imgBottom), tier sorting, and
+  // basename sanitization all run on the patched raw.
+  const { resolvedId, spec: variantSpec } = _resolveVariant(raw, requestedVariant);
+  const patchedRaw = variantSpec ? _applyVariantPatch(raw, variantSpec, themeId, resolvedId) : raw;
+
   // Merge defaults for optional fields
-  const theme = mergeDefaults(raw, themeId, isBuiltin);
+  const theme = mergeDefaults(patchedRaw, themeId, isBuiltin);
   theme._themeDir = themeDir;
+  theme._variantId = resolvedId;
 
   // For external themes: sanitize SVGs + resolve asset paths
   if (!isBuiltin) {
@@ -558,6 +590,151 @@ function validateTheme(cfg) {
 
 // ── Internal helpers ──
 
+function _isPlainObject(v) {
+  return v && typeof v === "object" && !Array.isArray(v);
+}
+
+/**
+ * Deep-merge two plain objects. Arrays on the patch side replace wholesale
+ * (Clawd's array fields have positional semantics — tier order, random pool —
+ * where deep-merge would be ill-defined). Scalars on the patch side win.
+ */
+function _deepMergeObject(base, patch) {
+  if (!_isPlainObject(base)) return patch;
+  const out = { ...base };
+  for (const [k, v] of Object.entries(patch)) {
+    if (_isPlainObject(v) && _isPlainObject(out[k])) {
+      out[k] = _deepMergeObject(out[k], v);
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+/**
+ * Resolve a requested variant id against the theme's declared variants.
+ * Synthesises a `default` variant when the author didn't declare one so the
+ * UI can always show at least one option.
+ * Unknown variant ids lenient-fallback to `default`.
+ *
+ * @returns {{ resolvedId: string, spec: object|null }}
+ *   `spec` is null when the resolved variant is a synthetic default (no patch needed).
+ */
+function _resolveVariant(raw, requestedVariant) {
+  const rawVariants = _isPlainObject(raw.variants) ? raw.variants : {};
+  const hasExplicitDefault = _isPlainObject(rawVariants.default);
+  const targetId = requestedVariant || "default";
+
+  if (rawVariants[targetId] && _isPlainObject(rawVariants[targetId])) {
+    return { resolvedId: targetId, spec: rawVariants[targetId] };
+  }
+  // Unknown variant → lenient fallback to default (synthetic or explicit)
+  if (hasExplicitDefault) {
+    return { resolvedId: "default", spec: rawVariants.default };
+  }
+  return { resolvedId: "default", spec: null };
+}
+
+/**
+ * Apply a variant spec on top of raw theme config.
+ * - allow-list fields are patched per `VARIANT_REPLACE_FIELDS` (replace vs deep-merge)
+ * - out-of-list fields are ignored with a warning (author typos surface clearly)
+ * - metadata fields (name/description/preview) are stripped — they belong to the
+ *   variant metadata layer, not runtime theme config
+ *
+ * Runs on raw before mergeDefaults so downstream geometry derivation sees
+ * the patched values (see §6.1 rationale in plan-settings-panel-3b-swap.md).
+ */
+function _applyVariantPatch(raw, variantSpec, themeId, variantId) {
+  const patched = { ...raw };
+  for (const [key, value] of Object.entries(variantSpec)) {
+    // Metadata-only fields — don't copy into runtime config
+    if (key === "name" || key === "description" || key === "preview") continue;
+    if (!VARIANT_ALLOWED_KEYS.has(key)) {
+      console.warn(`[theme-loader] variant "${themeId}:${variantId}" declares ignored field "${key}" (not in allow-list)`);
+      continue;
+    }
+    if (VARIANT_REPLACE_FIELDS.has(key) || Array.isArray(value)) {
+      patched[key] = value;
+    } else if (_isPlainObject(value)) {
+      patched[key] = _isPlainObject(patched[key]) ? _deepMergeObject(patched[key], value) : value;
+    } else {
+      patched[key] = value;
+    }
+  }
+  return patched;
+}
+
+/**
+ * Build preview URL for a single variant. Fallback chain:
+ *   variant.preview → variant.idleAnimations[0].file → root theme preview
+ *
+ * Avoids "all variant cards show the same preview" when variants only differ
+ * in tiers/timings but not in any visible asset.
+ */
+function _buildVariantPreviewUrl(raw, variantSpec, themeDir, isBuiltin) {
+  let previewFile = null;
+  if (variantSpec) {
+    if (typeof variantSpec.preview === "string" && variantSpec.preview) {
+      previewFile = variantSpec.preview;
+    } else if (Array.isArray(variantSpec.idleAnimations)
+               && variantSpec.idleAnimations[0]
+               && typeof variantSpec.idleAnimations[0].file === "string") {
+      previewFile = variantSpec.idleAnimations[0].file;
+    }
+  }
+  if (previewFile) {
+    const filename = path.basename(previewFile);
+    const themeLocal = path.join(themeDir, "assets", filename);
+    if (fs.existsSync(themeLocal)) {
+      try { return pathToFileURL(themeLocal).href; } catch {}
+    }
+    if (isBuiltin && assetsSvgDir) {
+      const central = path.join(assetsSvgDir, filename);
+      if (fs.existsSync(central)) {
+        try { return pathToFileURL(central).href; } catch {}
+      }
+    }
+  }
+  return _buildPreviewUrl(raw, themeDir, isBuiltin);
+}
+
+/**
+ * Normalize a theme's variants for metadata consumers (settings panel).
+ * - Always includes a `default` entry (synthetic if author didn't declare one)
+ * - Each entry: { id, name, description, previewFileUrl }
+ * - `name` / `description` preserved as-is (string or {en,zh} — UI handles i18n)
+ */
+function _buildVariantMetadata(raw, themeDir, isBuiltin) {
+  const rawVariants = _isPlainObject(raw.variants) ? raw.variants : {};
+  const hasExplicitDefault = _isPlainObject(rawVariants.default);
+  const out = [];
+
+  if (!hasExplicitDefault) {
+    // i18n object — settings-renderer's localizeField() picks the right key.
+    // Don't reuse raw.name here: that would label the synthetic default with
+    // the theme's own name (e.g. "Clawd"), creating a confusing duplicate of
+    // the theme card's title inside its own variant strip.
+    out.push({
+      id: "default",
+      name: { en: "Standard", zh: "标准" },
+      description: null,
+      previewFileUrl: _buildPreviewUrl(raw, themeDir, isBuiltin),
+    });
+  }
+  for (const [id, spec] of Object.entries(rawVariants)) {
+    if (!_isPlainObject(spec)) continue;
+    out.push({
+      id,
+      name: (spec.name != null) ? spec.name : id,
+      description: (spec.description != null) ? spec.description : null,
+      previewFileUrl: _buildVariantPreviewUrl(raw, spec, themeDir, isBuiltin),
+    });
+  }
+  return out;
+}
+
 function mergeDefaults(raw, themeId, isBuiltin) {
   const theme = { ...raw, _id: themeId, _builtin: !!isBuiltin };
 
@@ -755,6 +932,7 @@ function getThemeMetadata(themeId) {
     name: raw.name || themeId,
     builtin: !!isBuiltin,
     previewFileUrl: _buildPreviewUrl(raw, themeDir, isBuiltin),
+    variants: _buildVariantMetadata(raw, themeDir, isBuiltin),
   };
 }
 
@@ -786,6 +964,7 @@ function _scanMetadata(dir, builtin, themes, seen) {
         name: raw.name || entry.name,
         builtin,
         previewFileUrl: _buildPreviewUrl(raw, themeDir, builtin),
+        variants: _buildVariantMetadata(raw, themeDir, builtin),
       });
       seen.add(entry.name);
     }

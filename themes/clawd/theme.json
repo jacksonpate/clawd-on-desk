@@ -149,5 +149,35 @@
     "heightRatio": 1.3,
     "offsetX":    -0.45,
     "offsetY":    -0.25
+  },
+
+  "variantsSchemaVersion": 0,
+  "variants": {
+    "conductor": {
+      "name": { "en": "Conductor", "zh": "指挥家" },
+      "description": {
+        "en": "Swaps juggling and conducting: 2 sessions conducts, subagent fleet juggles.",
+        "zh": "玩杂耍和指挥家对调：2 会话时指挥，subagent 多了就玩杂耍。"
+      },
+      "preview": "clawd-working-conducting.svg",
+      "workingTiers": [
+        { "minSessions": 3, "file": "clawd-working-building.svg" },
+        { "minSessions": 2, "file": "clawd-working-conducting.svg" },
+        { "minSessions": 1, "file": "clawd-working-typing.svg" }
+      ],
+      "jugglingTiers": [
+        { "minSessions": 2, "file": "clawd-working-juggling.svg" },
+        { "minSessions": 1, "file": "clawd-working-conducting.svg" }
+      ],
+      "displayHintMap": {
+        "clawd-working-building.svg":   "clawd-working-building.svg",
+        "clawd-working-typing.svg":     "clawd-working-typing.svg",
+        "clawd-working-juggling.svg":   "clawd-working-conducting.svg",
+        "clawd-working-conducting.svg": "clawd-working-juggling.svg",
+        "clawd-idle-reading.svg":       "clawd-idle-reading.svg",
+        "clawd-working-debugger.svg":   "clawd-working-debugger.svg",
+        "clawd-working-thinking.svg":   "clawd-working-thinking.svg"
+      }
+    }
   }
 }

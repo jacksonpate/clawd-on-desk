@@ -122,7 +122,9 @@ const _settingsController = createSettingsController({
     clearSessionsByAgent: _deferredClearSessionsByAgent,
     dismissPermissionsByAgent: _deferredDismissPermissionsByAgent,
     // Theme deps — defined much later in the file, wrapped in lazy closures.
-    activateTheme: (id) => _deferredActivateTheme(id),
+    // activateTheme accepts (themeId, variantId?) and returns { themeId, variantId }
+    // with the actually-resolved variantId (lenient fallback on unknown variants).
+    activateTheme: (id, variantId) => _deferredActivateTheme(id, variantId),
     getThemeInfo: (id) => _deferredGetThemeInfo(id),
     removeThemeDir: (id) => _deferredRemoveThemeDir(id),
   },
@@ -199,12 +201,28 @@ const themeLoader = require("./theme-loader");
 themeLoader.init(__dirname, app.getPath("userData"));
 
 // Lenient load so a missing/corrupt user-selected theme can't brick boot.
-// If lenient fell back to "clawd", hydrate prefs to match so the store
-// stays truth.
+// If lenient fell back to "clawd" OR the variant fell back to "default",
+// hydrate prefs to match so the store stays truth.
+//
+// Startup runs BEFORE the window is ready, so we call themeLoader.loadTheme
+// directly — not activateTheme (which requires ready windows) and not the
+// setThemeSelection command (which goes through activateTheme). The runtime
+// switch path via UI goes through setThemeSelection post-window-ready.
 const _requestedThemeId = _settingsController.get("theme") || "clawd";
-let activeTheme = themeLoader.loadTheme(_requestedThemeId);
-if (activeTheme._id !== _requestedThemeId) {
-  const result = _settingsController.hydrate({ theme: activeTheme._id });
+const _initialVariantMap = _settingsController.get("themeVariant") || {};
+const _requestedVariantId = _initialVariantMap[_requestedThemeId] || "default";
+let activeTheme = themeLoader.loadTheme(_requestedThemeId, { variant: _requestedVariantId });
+if (activeTheme._id !== _requestedThemeId || activeTheme._variantId !== _requestedVariantId) {
+  const nextVariantMap = { ...(_settingsController.get("themeVariant") || {}) };
+  // Self-heal: store the resolved ids so next boot doesn't fall back again.
+  nextVariantMap[activeTheme._id] = activeTheme._variantId;
+  if (activeTheme._id !== _requestedThemeId) {
+    delete nextVariantMap[_requestedThemeId];
+  }
+  const result = _settingsController.hydrate({
+    theme: activeTheme._id,
+    themeVariant: nextVariantMap,
+  });
   if (result && result.status === "error") {
     console.warn("Clawd: theme hydrate after fallback failed:", result.message);
   }
@@ -1452,14 +1470,25 @@ Object.defineProperties(this || {}, {}); // no-op placeholder
 // controller rejects the commit — otherwise prefs would record a theme id
 // that can't actually render. Does NOT write `theme` back to prefs; the
 // controller commits after this returns (writing here would infinite-loop).
-function activateTheme(themeId) {
+function activateTheme(themeId, variantId) {
   if (!win || win.isDestroyed()) {
     throw new Error("theme switch requires ready windows");
   }
-  if (activeTheme && activeTheme._id === themeId) return;
+  // Resolve variantId: explicit arg wins; else current per-theme preference; else default.
+  // (Unknown variants lenient-fallback inside loadTheme, so we still commit strict on themeId.)
+  const currentVariantMap = _settingsController.get("themeVariant") || {};
+  const targetVariant = (typeof variantId === "string" && variantId) ? variantId
+    : (currentVariantMap[themeId] || "default");
+
+  // Joint dedup: same theme + same variant → skip reload. Different variant
+  // on same theme MUST run the full reload pipeline (can't hot-patch tiers /
+  // displayHint / geometry safely — see plan-settings-panel-3b-swap.md §6.2).
+  if (activeTheme && activeTheme._id === themeId && activeTheme._variantId === targetVariant) {
+    return { themeId, variantId: activeTheme._variantId };
+  }
 
   // Strict load first: if it throws, nothing downstream has mutated yet.
-  const newTheme = themeLoader.loadTheme(themeId, { strict: true });
+  const newTheme = themeLoader.loadTheme(themeId, { strict: true, variant: targetVariant });
 
   _state.cleanup();
   _tick.cleanup();
@@ -1495,13 +1524,17 @@ function activateTheme(themeId) {
   hitWin.webContents.once("did-finish-load", onReady);
 
   flushRuntimeStateToPrefs();
+
+  // Return resolved ids so the caller (setThemeSelection command) can commit
+  // the actually-loaded variantId — handles "author deleted variant" dirty state.
+  return { themeId, variantId: newTheme._variantId };
 }
 
 // Inject theme deps into the settings controller now that activateTheme,
 // themeLoader, and activeTheme are all defined. Uses lazy closures because
 // these references are captured at call time (inside an effect or command).
-function _deferredActivateTheme(themeId) {
-  return activateTheme(themeId);
+function _deferredActivateTheme(themeId, variantId) {
+  return activateTheme(themeId, variantId);
 }
 function _deferredGetThemeInfo(themeId) {
   const all = themeLoader.discoverThemes();

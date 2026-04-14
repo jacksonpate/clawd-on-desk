@@ -246,6 +246,13 @@ const updateRegistry = {
   agents: requirePlainObject("agents"),
   themeOverrides: requirePlainObject("themeOverrides"),
 
+  // Phase 3b-swap: per-theme variant selection. NO effect — the runtime switch
+  // runs through the `setThemeSelection` command which atomically commits
+  // `theme` + `themeVariant` after calling activateTheme(themeId, variantId).
+  // Letting this field have an effect would double-activate when the UI
+  // updates `theme` and `themeVariant` separately.
+  themeVariant: requirePlainObject("themeVariant"),
+
   // ── Internal — version is owned by prefs.js / migrate(), shouldn't normally
   //    be set via applyUpdate, but we accept it so programmatic upgrades work. ──
   version(value) {
@@ -376,12 +383,68 @@ async function removeTheme(payload, deps) {
 
   const snapshot = deps.snapshot || {};
   const currentOverrides = snapshot.themeOverrides || {};
+  const currentVariantMap = snapshot.themeVariant || {};
+  const nextCommit = {};
   if (currentOverrides[themeId]) {
     const nextOverrides = { ...currentOverrides };
     delete nextOverrides[themeId];
-    return { status: "ok", commit: { themeOverrides: nextOverrides } };
+    nextCommit.themeOverrides = nextOverrides;
+  }
+  if (currentVariantMap[themeId] !== undefined) {
+    const nextVariantMap = { ...currentVariantMap };
+    delete nextVariantMap[themeId];
+    nextCommit.themeVariant = nextVariantMap;
+  }
+  if (Object.keys(nextCommit).length > 0) {
+    return { status: "ok", commit: nextCommit };
   }
   return { status: "ok" };
+}
+
+// Phase 3b-swap: atomic theme + variant switch.
+//   payload: { themeId: string, variantId?: string }
+// Why a dedicated command vs. letting the `theme` field effect handle it:
+// the theme effect only commits `{theme}`, so the dirty "author deleted the
+// variant user had selected" scenario leaves `themeVariant[themeId]` pointing
+// at a dead variantId. Fix: call activateTheme which lenient-fallbacks unknown
+// variants, read back the actually-resolved variantId, and commit both fields.
+// See docs/plan-settings-panel-3b-swap.md §6.2 "Runtime 切换路径".
+const _validateSetThemeSelectionThemeId = requireString("setThemeSelection.themeId");
+function setThemeSelection(payload, deps) {
+  const themeId = typeof payload === "string" ? payload : (payload && payload.themeId);
+  const variantIdInput = (payload && typeof payload === "object") ? payload.variantId : null;
+  const idCheck = _validateSetThemeSelectionThemeId(themeId);
+  if (idCheck.status !== "ok") return idCheck;
+  if (variantIdInput != null && (typeof variantIdInput !== "string" || !variantIdInput)) {
+    return { status: "error", message: "setThemeSelection.variantId must be a non-empty string when provided" };
+  }
+
+  if (!deps || typeof deps.activateTheme !== "function") {
+    return { status: "error", message: "setThemeSelection effect requires activateTheme dep" };
+  }
+
+  const snapshot = deps.snapshot || {};
+  const currentVariantMap = snapshot.themeVariant || {};
+  const targetVariant = variantIdInput || currentVariantMap[themeId] || "default";
+
+  let resolved;
+  try {
+    resolved = deps.activateTheme(themeId, targetVariant);
+  } catch (err) {
+    return { status: "error", message: `setThemeSelection: ${err && err.message}` };
+  }
+  // activateTheme returns { themeId, variantId } — the variantId here reflects
+  // lenient fallback (dead variant → "default"). We commit the resolved value
+  // so prefs self-heal away from stale ids.
+  const resolvedVariant = (resolved && typeof resolved === "object" && typeof resolved.variantId === "string")
+    ? resolved.variantId
+    : targetVariant;
+
+  const nextVariantMap = { ...currentVariantMap, [themeId]: resolvedVariant };
+  return {
+    status: "ok",
+    commit: { theme: themeId, themeVariant: nextVariantMap },
+  };
 }
 
 // Phase 3b: 仅允许 override 这 5 个"打扰态"——其他 state 要么不走 theme.states
@@ -468,6 +531,7 @@ const commandRegistry = {
   setAgentFlag,
   setThemeOverrideDisabled,
   resetThemeOverrides,
+  setThemeSelection,
 };
 
 module.exports = {
