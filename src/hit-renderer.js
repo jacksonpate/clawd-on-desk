@@ -228,5 +228,9 @@ function endDragReaction() {
 // --- Right-click context menu ---
 document.addEventListener("contextmenu", (e) => {
   e.preventDefault();
-  window.hitAPI.showContextMenu();
+  if (e.ctrlKey || e.metaKey) {
+    window.hitAPI.cyclePinnedSession();
+  } else {
+    window.hitAPI.showContextMenu();
+  }
 });

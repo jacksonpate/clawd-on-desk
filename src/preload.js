@@ -24,4 +24,6 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // Render window → main (cursor polling control during reactions)
   pauseCursorPolling: () => ipcRenderer.send("pause-cursor-polling"),
   resumeFromReaction: () => ipcRenderer.send("resume-from-reaction"),
+  // Toast notification
+  onShowToast: (cb) => ipcRenderer.on("show-toast", (_, msg) => cb(msg)),
 });

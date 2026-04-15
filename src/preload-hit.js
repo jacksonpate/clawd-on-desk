@@ -14,6 +14,7 @@ contextBridge.exposeInMainWorld("hitAPI", {
   moveWindowBy: (dx, dy) => ipcRenderer.send("move-window-by", dx, dy),
   dragEnd: () => ipcRenderer.send("drag-end"),
   showContextMenu: () => ipcRenderer.send("show-context-menu"),
+  cyclePinnedSession: () => ipcRenderer.send("cycle-pinned-session"),
   focusTerminal: () => ipcRenderer.send("focus-terminal"),
   exitMiniMode: () => ipcRenderer.send("exit-mini-mode"),
   showSessionMenu: () => ipcRenderer.send("show-session-menu"),

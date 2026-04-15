@@ -780,3 +780,26 @@ if (!currentDisplayedSvg && _idleFollowSvg) {
   currentIdleSvg = _idleFollowSvg;
   swapToFile(_idleFollowSvg, "idle");
 }
+
+// --- Session switch toast ---
+let _toastEl = null;
+let _toastTimer = null;
+window.electronAPI.onShowToast((msg) => {
+  if (!_toastEl) {
+    _toastEl = document.createElement("div");
+    _toastEl.style.cssText = [
+      "position:fixed", "bottom:8px", "left:50%", "transform:translateX(-50%)",
+      "background:rgba(20,20,22,0.92)", "color:#fff",
+      "font:600 12px/1 -apple-system,sans-serif",
+      "padding:5px 12px", "border-radius:20px",
+      "white-space:nowrap", "pointer-events:none",
+      "transition:opacity 0.2s", "z-index:9999",
+      "border:1px solid rgba(217,119,87,0.6)",
+    ].join(";");
+    document.body.appendChild(_toastEl);
+  }
+  _toastEl.textContent = msg;
+  _toastEl.style.opacity = "1";
+  if (_toastTimer) clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => { if (_toastEl) _toastEl.style.opacity = "0"; }, 2500);
+});

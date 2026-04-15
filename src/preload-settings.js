@@ -35,6 +35,9 @@ contextBridge.exposeInMainWorld("settingsAPI", {
   command: (action, payload) => ipcRenderer.invoke("settings:command", { action, payload }),
   listAgents: () => ipcRenderer.invoke("settings:list-agents"),
   listThemes: () => ipcRenderer.invoke("settings:list-themes"),
+  listSessions: () => ipcRenderer.invoke("settings:list-sessions"),
+  pinSession: (id) => ipcRenderer.invoke("settings:pin-session", id),
+  clearPinnedSessions: () => ipcRenderer.invoke("settings:clear-pinned-sessions"),
   confirmRemoveTheme: (themeId) =>
     ipcRenderer.invoke("settings:confirm-remove-theme", themeId),
   confirmDisableClaudeHooks: () =>

@@ -19,6 +19,8 @@ module.exports = function initChat(ctx) {
 let chatWin      = null;
 let measuredH    = BUBBLE_H;
 let ipcRegistered = false;
+let suppressUnfreeze = false; // true when closing due to a freeze command
+let manuallyFrozen = false;   // true while Clawd is frozen by "be still" command — persists across bubble opens
 
 function getPosition() {
   if (!ctx.win || ctx.win.isDestroyed()) return { x: 100, y: 100 };
@@ -55,6 +57,8 @@ function sendMessage(msg) {
   // Intercept movement commands — handle locally, don't send to Claude Code
   const trimmed = msg.trim();
   if (FREEZE_CMDS.test(trimmed)) {
+    manuallyFrozen = true;
+    suppressUnfreeze = true; // don't let this specific close undo the freeze
     if (chatWin && !chatWin.isDestroyed()) {
       chatWin.webContents.send("chat-hide");
       setTimeout(() => { if (chatWin && !chatWin.isDestroyed()) { chatWin.close(); chatWin = null; } }, 350);
@@ -63,6 +67,8 @@ function sendMessage(msg) {
     return;
   }
   if (UNFREEZE_CMDS.test(trimmed)) {
+    manuallyFrozen = false;
+    suppressUnfreeze = false;
     if (chatWin && !chatWin.isDestroyed()) {
       chatWin.webContents.send("chat-hide");
       setTimeout(() => { if (chatWin && !chatWin.isDestroyed()) { chatWin.close(); chatWin = null; } }, 350);
@@ -83,6 +89,33 @@ function sendMessage(msg) {
   }
 
   if (isWin) {
+    // Pick best session (pinned first, else most recent)
+    let targetPid = 0, targetCwd = "";
+    const pinned = ctx.pinnedSessionIds;
+    const hasPins = pinned && pinned.size > 0;
+    if (ctx.sessions) {
+      let latest = 0;
+      for (const [id, s] of ctx.sessions) {
+        if (hasPins && !pinned.has(id)) continue;
+        if (s.sourcePid && (s.updatedAt || 0) >= latest) {
+          latest = s.updatedAt || 0;
+          targetPid = s.sourcePid;
+          targetCwd = s.cwd || "";
+        }
+      }
+    }
+    // If pins are set but session not yet in Map (e.g. after Clawd restart),
+    // fall back to saved cwd from pinnedSessionCwds
+    if (hasPins && !targetCwd && ctx.pinnedSessionCwds) {
+      for (const id of pinned) {
+        const savedCwd = ctx.pinnedSessionCwds[id];
+        if (savedCwd) { targetCwd = savedCwd; break; }
+      }
+    }
+    // Folder name from cwd for window title matching (e.g. "Project_P", "jpate")
+    const folderName = targetCwd ? targetCwd.split(/[\\/]/).pop() : "";
+    try { require("fs").appendFileSync(require("path").join(require("os").homedir(), "AppData", "Roaming", "clawd-on-desk", "clawd-chat-debug.log"), `[${new Date().toISOString()}] targetPid=${targetPid} targetCwd=${targetCwd} folderName=${folderName} pinnedSize=${ctx.pinnedSessionIds ? ctx.pinnedSessionIds.size : "N/A"}\n`); } catch {}
+
     // Encode message as base64 UTF-16LE so it survives embedding in the PS script
     const msgB64 = Buffer.from(msg, "utf16le").toString("base64");
 
@@ -113,6 +146,7 @@ public class WinSend {
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsDelegate cb, IntPtr lp);
   [DllImport("user32.dll")] public static extern IntPtr FindWindowEx(IntPtr p, IntPtr a, string c, string t);
   [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte sc, uint fl, UIntPtr ei);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, ref int lpdwProcessId);
   public delegate bool EnumWindowsDelegate(IntPtr h, IntPtr lp);
 
   // Inject text via PostMessage WM_CHAR — works on minimized/background windows
@@ -172,13 +206,49 @@ public class WinSend {
     keybd_event(0x12,0,2,UIntPtr.Zero);
     SetForegroundWindow(h);
   }
+
+  // Find first visible window (any class) whose title contains folderName
+  // Skips known system/Clawd windows and background-only windows
+  public static IntPtr FindWindowByTitle(string folderName) {
+    IntPtr found = IntPtr.Zero;
+    EnumWindows((h, _) => {
+      if (!IsWindowVisible(h) && !IsIconic(h)) return true;
+      var ttl = new StringBuilder(512); GetWindowText(h, ttl, 512);
+      string t = ttl.ToString();
+      if (t.Length == 0 || t == "Claude" || t == "Clawd") return true;
+      if (t.IndexOf(folderName, StringComparison.OrdinalIgnoreCase) >= 0) {
+        found = h; return false;
+      }
+      return true;
+    }, IntPtr.Zero);
+    return found;
+  }
 }
 "@
 
 Add-Type -AssemblyName System.Windows.Forms
 
-$cdHwnd = [WinSend]::FindClaudeDesktop()
-$target  = if ($cdHwnd -ne [IntPtr]::Zero) { $cdHwnd } else { [WinSend]::FindMintty() }
+$folderName = "${folderName}"
+
+# Strategy:
+# 1. If folderName given, find an Electron/VS Code window whose title contains it (not "Claude")
+# 2. Fall back to Claude Desktop, then mintty
+$target = [IntPtr]::Zero
+
+$dbg = "$env:APPDATA\\clawd-on-desk\\clawd-ps-debug.log"
+
+if ($folderName -ne "") {
+  $target = [WinSend]::FindWindowByTitle($folderName)
+  Add-Content $dbg "[$(Get-Date -f o)] folderName=$folderName FindWindowByTitle=$target"
+}
+
+if ($target -eq [IntPtr]::Zero) {
+  $cdHwnd = [WinSend]::FindClaudeDesktop()
+  $target  = if ($cdHwnd -ne [IntPtr]::Zero) { $cdHwnd } else { [WinSend]::FindMintty() }
+  Add-Content $dbg "[$(Get-Date -f o)] fallback cdHwnd=$cdHwnd target=$target"
+}
+
+Add-Content $dbg "[$(Get-Date -f o)] final target=$target"
 [System.Windows.Forms.Clipboard]::SetText($text)
 if ($target -ne [IntPtr]::Zero) {
   [WinSend]::FocusWindow($target)
@@ -195,8 +265,12 @@ if ($target -ne [IntPtr]::Zero) {
   } else if (isMac && ctx.focusTerminalWindow) {
     let bestPid = null, bestCwd = null, bestEditor = null, bestChain = null;
     if (ctx.sessions) {
+      const pinned = ctx.pinnedSessionIds;
+      const hasPins = pinned && pinned.size > 0;
       let latest = 0;
-      for (const [, s] of ctx.sessions) {
+      for (const [id, s] of ctx.sessions) {
+        // If sessions are pinned, only consider pinned ones
+        if (hasPins && !pinned.has(id)) continue;
         if (s.sourcePid && (s.updatedAt || 0) >= latest) {
           latest = s.updatedAt || 0;
           bestPid = s.sourcePid; bestCwd = s.cwd;
@@ -261,8 +335,9 @@ function show() {
 
   chatWin.on("closed", () => {
     chatWin = null;
-    // Unfreeze Clawd when bubble closes
-    if (ctx.unfreezeFollower) ctx.unfreezeFollower();
+    // Only unfreeze if: not suppressed by this close, AND not in a manual freeze
+    if (!suppressUnfreeze && !manuallyFrozen && ctx.unfreezeFollower) ctx.unfreezeFollower();
+    suppressUnfreeze = false;
   });
 }
 

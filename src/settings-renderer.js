@@ -119,6 +119,13 @@ const STRINGS = {
     animOverridesModalUse: "Use this file",
     animOverridesModalCancel: "Cancel",
     animOverridesRefresh: "Refresh list",
+    sidebarSessions: "Sessions",
+    sessionsTitle: "Sessions",
+    sessionsSubtitle: "Active Claude Code sessions. Pin one to lock Clawd to it — all other sessions will be ignored.",
+    sessionsEmpty: "No active sessions.",
+    sessionsPinned: "Pinned",
+    sessionsUnpin: "Unpin",
+    sessionsPin: "Pin",
   },
   zh: {
     settingsTitle: "设置",
@@ -224,6 +231,13 @@ const STRINGS = {
     animOverridesModalUse: "使用这个文件",
     animOverridesModalCancel: "取消",
     animOverridesRefresh: "刷新列表",
+    sidebarSessions: "会话",
+    sessionsTitle: "会话",
+    sessionsSubtitle: "当前活跃的 Claude Code 会话。固定一个后 Clawd 将只响应该会话，其余忽略。",
+    sessionsEmpty: "没有活跃会话。",
+    sessionsPinned: "已固定",
+    sessionsUnpin: "取消固定",
+    sessionsPin: "固定",
   },
 };
 
@@ -273,6 +287,7 @@ const SIDEBAR_TABS = [
   { id: "theme", icon: "\u{1F3A8}", labelKey: "sidebarTheme", available: true },
   { id: "animMap", icon: "\u{1F3AC}", labelKey: "sidebarAnimMap", available: true },
   { id: "animOverrides", icon: "\u{1F39E}", labelKey: "sidebarAnimOverrides", available: true },
+  { id: "sessions", icon: "\u{1F5C2}", labelKey: "sidebarSessions", available: true },
   { id: "shortcuts", icon: "\u2328", labelKey: "sidebarShortcuts", available: false },
   { id: "about", icon: "\u2139", labelKey: "sidebarAbout", available: false },
 ];
@@ -304,6 +319,7 @@ function renderSidebar() {
 function renderContent() {
   const content = document.getElementById("content");
   if (activeTab !== "animOverrides" && assetPickerState) closeAssetPicker();
+  if (activeTab !== "sessions" && sessionsPollTimer) { clearInterval(sessionsPollTimer); sessionsPollTimer = null; }
   content.innerHTML = "";
   if (activeTab === "general") {
     renderGeneralTab(content);
@@ -315,6 +331,8 @@ function renderContent() {
     renderAnimMapTab(content);
   } else if (activeTab === "animOverrides") {
     renderAnimOverridesTab(content);
+  } else if (activeTab === "sessions") {
+    renderSessionsTab(content);
   } else {
     renderPlaceholder(content);
   }
@@ -1449,6 +1467,148 @@ function renderPlaceholder(parent) {
     `<div class="placeholder-title">${escapeHtml(t("placeholderTitle"))}</div>` +
     `<div class="placeholder-desc">${escapeHtml(t("placeholderDesc"))}</div>`;
   parent.appendChild(div);
+}
+
+// ── Sessions tab ──
+let sessionsPollTimer = null;
+
+const SESSION_STATE_LABEL = {
+  offline:      "Offline",
+  working:      "Active",
+  thinking:     "Active",
+  sweeping:     "Active",
+  carrying:     "Active",
+  notification: "Active",
+  attention:    "Idle",
+  idle:         "Idle",
+  error:        "Error",
+};
+const SESSION_STATE_COLOR = {
+  offline:      "#52525b",
+  working:      "#22c55e",
+  thinking:     "#3b82f6",
+  sweeping:     "#a855f7",
+  carrying:     "#f59e0b",
+  notification: "#f59e0b",
+  attention:    "#71717a",
+  idle:         "#71717a",
+  error:        "#ef4444",
+};
+
+async function renderSessionsTab(parent) {
+  if (sessionsPollTimer) { clearInterval(sessionsPollTimer); sessionsPollTimer = null; }
+
+  const h1 = document.createElement("h1");
+  h1.textContent = t("sessionsTitle");
+  parent.appendChild(h1);
+
+  const sub = document.createElement("p");
+  sub.className = "tab-subtitle";
+  sub.textContent = "Active Claude Code sessions. Check one or more to lock Clawd to those sessions only. Uncheck all to respond to every session.";
+  parent.appendChild(sub);
+
+  // Header row: session count + "Clear all" link
+  const headerRow = document.createElement("div");
+  headerRow.style.cssText = "display:flex;align-items:center;justify-content:space-between;margin-top:16px;margin-bottom:8px;";
+  const countLabel = document.createElement("span");
+  countLabel.style.cssText = "font-size:12px;font-weight:600;color:var(--text-sub);text-transform:uppercase;letter-spacing:0.04em;";
+  headerRow.appendChild(countLabel);
+  const clearBtn = document.createElement("button");
+  clearBtn.className = "btn-secondary";
+  clearBtn.style.cssText = "font-size:11px;padding:2px 8px;";
+  clearBtn.textContent = "Clear all";
+  clearBtn.addEventListener("click", async () => {
+    await window.settingsAPI.clearPinnedSessions();
+    refresh();
+  });
+  headerRow.appendChild(clearBtn);
+  parent.appendChild(headerRow);
+
+  const list = document.createElement("div");
+  list.style.cssText = "display:flex;flex-direction:column;gap:6px;";
+  parent.appendChild(list);
+
+  async function refresh() {
+    if (activeTab !== "sessions") { clearInterval(sessionsPollTimer); sessionsPollTimer = null; return; }
+    const { sessions, pinnedSessionIds } = await window.settingsAPI.listSessions();
+    const pinned = new Set(pinnedSessionIds || []);
+
+    countLabel.textContent = sessions.length
+      ? `${sessions.length} session${sessions.length !== 1 ? "s" : ""}${pinned.size ? `  ·  ${pinned.size} selected` : "  ·  all active"}`
+      : "No sessions";
+    clearBtn.style.display = pinned.size ? "" : "none";
+
+    list.innerHTML = "";
+
+    if (!sessions.length) {
+      const empty = document.createElement("p");
+      empty.style.cssText = "color:var(--text-sub);font-size:13px;padding:8px 0;";
+      empty.textContent = "No active sessions yet — send a message in Claude Code to register one.";
+      list.appendChild(empty);
+      return;
+    }
+
+    for (const s of sessions) {
+      const isPinned = pinned.has(s.id);
+      const isOffline = !!s.offline;
+      const stateLabel = SESSION_STATE_LABEL[s.state] || "Idle";
+      const stateColor = SESSION_STATE_COLOR[s.state] || "#71717a";
+      const folderName = s.cwd ? s.cwd.split(/[\\/]/).pop() : s.id.slice(0, 8);
+
+      const row = document.createElement("div");
+      row.style.cssText = `display:flex;align-items:center;gap:12px;padding:10px 14px;
+        background:${isPinned && !isOffline ? "rgba(217,119,87,0.08)" : "var(--input-bg)"};
+        border:1.5px solid ${isPinned ? (isOffline ? "rgba(217,119,87,0.35)" : "#d97757") : "var(--card-border)"};
+        border-radius:10px;cursor:pointer;transition:border-color 0.15s,background 0.15s;
+        opacity:${isOffline ? "0.6" : "1"};`;
+
+      // Checkmark
+      const check = document.createElement("span");
+      check.style.cssText = `width:18px;height:18px;border-radius:5px;border:2px solid ${isPinned ? "#d97757" : "var(--card-border)"};
+        background:${isPinned ? "#d97757" : "transparent"};display:flex;align-items:center;justify-content:center;
+        flex-shrink:0;transition:all 0.15s;font-size:11px;color:#fff;font-weight:700;`;
+      check.textContent = isPinned ? "✓" : "";
+      row.appendChild(check);
+
+      // State dot
+      const dot = document.createElement("span");
+      dot.style.cssText = `width:7px;height:7px;border-radius:50%;background:${stateColor};flex-shrink:0;`;
+      row.appendChild(dot);
+
+      // Label
+      const label = document.createElement("div");
+      label.style.cssText = "flex:1;min-width:0;";
+
+      const nameEl = document.createElement("div");
+      nameEl.style.cssText = "font-size:13px;font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+      nameEl.textContent = folderName + (s.host ? ` @ ${s.host}` : "") + (s.headless ? " 🤖" : "");
+      label.appendChild(nameEl);
+
+      const metaEl = document.createElement("div");
+      metaEl.style.cssText = "font-size:11px;color:var(--text-sub);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+      metaEl.textContent = (s.cwd || s.id.slice(0, 16));
+      label.appendChild(metaEl);
+
+      row.appendChild(label);
+
+      // State badge
+      const badge = document.createElement("span");
+      badge.style.cssText = `font-size:11px;font-weight:600;color:${stateColor};flex-shrink:0;`;
+      badge.textContent = stateLabel;
+      row.appendChild(badge);
+
+      // Toggle on click
+      row.addEventListener("click", async () => {
+        await window.settingsAPI.pinSession(s.id);
+        refresh();
+      });
+
+      list.appendChild(row);
+    }
+  }
+
+  await refresh();
+  sessionsPollTimer = setInterval(refresh, 2000);
 }
 
 function renderGeneralTab(parent) {

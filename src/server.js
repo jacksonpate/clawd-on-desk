@@ -281,6 +281,13 @@ function startHttpServer() {
             res.end();
             return;
           }
+          // Session pin filter: if user has pinned specific sessions, drop events from others
+          const sid0 = session_id || "default";
+          if (typeof ctx.isSessionAllowed === "function" && !ctx.isSessionAllowed(sid0)) {
+            res.writeHead(204, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
+            res.end();
+            return;
+          }
           if (ctx.STATE_SVGS[state]) {
             const sid = session_id || "default";
             if (state.startsWith("mini-") && !svg) {
@@ -352,6 +359,16 @@ function startHttpServer() {
           // HTTP response (fire-and-forget), so a generic HTTP deny would
           // leave the TUI hanging until timeout. Instead we route DND
           // through the same reverse bridge the plugin uses for replies.
+          // Session pin filter: non-pinned sessions get a 204 so Claude Code
+          // falls back to its own built-in permission prompt in the terminal.
+          const permSid = typeof data.session_id === "string" ? data.session_id : "default";
+          if (typeof ctx.isSessionAllowed === "function" && !ctx.isSessionAllowed(permSid)) {
+            ctx.permLog(`session ${permSid} not pinned — passing through to terminal`);
+            res.writeHead(204, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
+            res.end();
+            return;
+          }
+
           if (data.agent_id === "opencode") {
             res.writeHead(200, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
             res.end("ok");
@@ -567,7 +584,15 @@ function startHttpServer() {
       req.on("end", () => {
         if (tooLarge) { res.writeHead(413); res.end(); return; }
         try {
-          const { response_text } = JSON.parse(body);
+          const { response_text, session_id: resp_sid } = JSON.parse(body);
+          // Session pin filter
+          const _respAllowed = typeof ctx.isSessionAllowed !== "function" || ctx.isSessionAllowed(resp_sid || "default");
+          try { require("fs").appendFileSync(require("path").join(require("os").homedir(), "AppData", "Roaming", "clawd-on-desk", "clawd-session-filter.log"), `[${new Date().toISOString()}] /response sid=${resp_sid} allowed=${_respAllowed}\n`); } catch {}
+          if (!_respAllowed) {
+            res.writeHead(204, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
+            res.end();
+            return;
+          }
           if (typeof response_text === "string" && response_text.trim() &&
               typeof ctx.showResponse === "function") {
             ctx.showResponse(response_text.trim());

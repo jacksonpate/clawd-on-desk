@@ -686,6 +686,8 @@ const { initFocusHelper, killFocusHelper, focusTerminalWindow, clearMacFocusCool
 const _chatCtx = {
   get win() { return win; },
   get sessions() { return sessions; },
+  get pinnedSessionIds() { return pinnedSessionIds; },
+  get pinnedSessionCwds() { return pinnedSessionCwds; },
   getNearestWorkArea: (x, y) => getNearestWorkArea(x, y),
   focusTerminalWindow: (...args) => focusTerminalWindow(...args),
   freezeFollower:  () => _follower.freeze(),
@@ -700,6 +702,35 @@ const _response = require("./response")({
   getNearestWorkArea: (x, y) => getNearestWorkArea(x, y),
 });
 
+// ── Pinned sessions — persisted across restarts via separate JSON file ──
+// Empty = respond to all sessions. Non-empty = whitelist.
+// Format: [{ id, cwd }] — cwd saved so chat routing works right after restart
+const PINNED_SESSIONS_PATH = path.join(app.getPath("userData"), "clawd-pinned-sessions.json");
+function _loadPinnedSessions() {
+  try {
+    const raw = JSON.parse(require("fs").readFileSync(PINNED_SESSIONS_PATH, "utf8"));
+    // Support both old format (array of strings) and new format (array of {id,cwd})
+    if (!Array.isArray(raw)) return { ids: [], cwds: {} };
+    const ids = [], cwds = {};
+    for (const entry of raw) {
+      if (typeof entry === "string") { ids.push(entry); }
+      else if (entry && typeof entry.id === "string") { ids.push(entry.id); if (entry.cwd) cwds[entry.id] = entry.cwd; }
+    }
+    return { ids, cwds };
+  } catch { return { ids: [], cwds: {} }; }
+}
+function _savePinnedSessions() {
+  try {
+    const arr = [...pinnedSessionIds].map(id => ({ id, cwd: pinnedSessionCwds[id] || null }));
+    require("fs").writeFileSync(PINNED_SESSIONS_PATH, JSON.stringify(arr));
+  } catch (err) {
+    console.error("Clawd: failed to save pinned sessions:", err && err.message);
+  }
+}
+const { ids: _loadedPinnedIds, cwds: _loadedPinnedCwds } = _loadPinnedSessions();
+const pinnedSessionIds = new Set(_loadedPinnedIds);
+const pinnedSessionCwds = { ..._loadedPinnedCwds }; // id -> cwd, updated when sessions register
+
 // ── HTTP server — delegated to src/server.js ──
 const _serverCtx = {
   get manageClaudeHooksAutomatically() { return manageClaudeHooksAutomatically; },
@@ -713,13 +744,28 @@ const _serverCtx = {
   isAgentEnabled: (agentId) => _isAgentEnabled({ agents: _settingsController.get("agents") }, agentId),
   isAgentPermissionsEnabled: (agentId) => _isAgentPermissionsEnabled({ agents: _settingsController.get("agents") }, agentId),
   setState,
-  updateSession,
+  updateSession: (sid, ...args) => {
+    // Keep pinnedSessionCwds fresh — cwd is args[2] (3rd positional after sid, state, event, sourcePid, cwd)
+    const cwd = args[3]; // updateSession(sid, state, event, sourcePid, cwd, ...)
+    if (cwd && pinnedSessionIds.has(sid) && pinnedSessionCwds[sid] !== cwd) {
+      pinnedSessionCwds[sid] = cwd;
+      _savePinnedSessions();
+    }
+    return updateSession(sid, ...args);
+  },
   resolvePermissionEntry,
   sendPermissionResponse,
   showPermissionBubble,
   replyOpencodePermission,
   permLog,
   showResponse: (text) => _response.show(text),
+  isSessionAllowed: (sessionId) => {
+    const allowed = pinnedSessionIds.size === 0 || pinnedSessionIds.has(sessionId);
+    if (pinnedSessionIds.size > 0) {
+      try { require("fs").appendFileSync(require("path").join(app.getPath("userData"), "clawd-session-filter.log"), `[${new Date().toISOString()}] incoming=${sessionId} pinned=[${[...pinnedSessionIds].join(",")}] allowed=${allowed}\n`); } catch {}
+    }
+    return allowed;
+  },
 };
 const _server = require("./server")(_serverCtx);
 const { startHttpServer, getHookServerPort } = _server;
@@ -1392,6 +1438,86 @@ ipcMain.handle("settings:confirm-disconnect-claude-hooks", async (event) => {
   }
 });
 
+ipcMain.handle("settings:list-sessions", () => {
+  const result = [];
+  const seenIds = new Set();
+  for (const [id, s] of sessions) {
+    seenIds.add(id);
+    result.push({
+      id,
+      state: s.state || "idle",
+      cwd: s.cwd || null,
+      updatedAt: s.updatedAt || 0,
+      host: s.host || null,
+      headless: !!s.headless,
+      agentId: s.agentId || null,
+      pinned: pinnedSessionIds.has(id),
+      offline: false,
+    });
+  }
+  // Also include pinned sessions that have been cleaned from the Map (offline)
+  for (const id of pinnedSessionIds) {
+    if (!seenIds.has(id)) {
+      result.push({
+        id,
+        state: "offline",
+        cwd: pinnedSessionCwds[id] || null,
+        updatedAt: 0,
+        host: null,
+        headless: false,
+        agentId: null,
+        pinned: true,
+        offline: true,
+      });
+    }
+  }
+  result.sort((a, b) => {
+    // Pinned online first, then others by updatedAt
+    if (a.pinned && !a.offline && (!b.pinned || b.offline)) return -1;
+    if (b.pinned && !b.offline && (!a.pinned || a.offline)) return 1;
+    return b.updatedAt - a.updatedAt;
+  });
+  return { sessions: result, pinnedSessionIds: [...pinnedSessionIds] };
+});
+
+function _resolvePinnedState() {
+  // After pin changes, update Clawd's display to reflect only pinned sessions.
+  // Non-pinned sessions stay in the Map (HTTP filter blocks their future events).
+  if (pinnedSessionIds.size === 0) return;
+  let hasActive = false;
+  for (const [id, s] of sessions) {
+    if (pinnedSessionIds.has(id) && s.state && s.state !== "idle" && s.state !== "attention") {
+      hasActive = true; break;
+    }
+  }
+  if (!hasActive) setState("idle");
+}
+
+ipcMain.handle("settings:pin-session", (_event, id) => {
+  if (!id) return { pinnedSessionIds: [...pinnedSessionIds] };
+  if (pinnedSessionIds.has(id)) {
+    // Toggle off — unpin
+    pinnedSessionIds.delete(id);
+    delete pinnedSessionCwds[id];
+  } else {
+    // Exclusive: clear all existing pins first
+    pinnedSessionIds.clear();
+    Object.keys(pinnedSessionCwds).forEach(k => delete pinnedSessionCwds[k]);
+    pinnedSessionIds.add(id);
+    const live = sessions.get(id);
+    if (live && live.cwd) pinnedSessionCwds[id] = live.cwd;
+  }
+  _savePinnedSessions();
+  _resolvePinnedState();
+  return { pinnedSessionIds: [...pinnedSessionIds] };
+});
+
+ipcMain.handle("settings:clear-pinned-sessions", () => {
+  pinnedSessionIds.clear();
+  _savePinnedSessions();
+  return { pinnedSessionIds: [] };
+});
+
 ipcMain.handle("settings:list-agents", () => {
   try {
     const { getAllAgents } = require("../agents/registry");
@@ -1677,6 +1803,38 @@ function createWindow() {
   }
 
   ipcMain.on("show-context-menu", () => _chat.show());
+
+  // Ctrl+right-click → cycle pinned session
+  ipcMain.on("cycle-pinned-session", () => {
+    // Build sorted session list (same order as sessions tab)
+    const list = [];
+    for (const [id, s] of sessions) {
+      list.push({ id, updatedAt: s.updatedAt || 0, cwd: s.cwd || "" });
+    }
+    if (list.length === 0) return;
+    list.sort((a, b) => b.updatedAt - a.updatedAt);
+
+    // Find current pinned index, advance to next
+    const currentPinned = [...pinnedSessionIds][0] || null;
+    const currentIdx = list.findIndex(s => s.id === currentPinned);
+    const nextIdx = (currentIdx + 1) % list.length;
+    const next = list[nextIdx];
+
+    // Exclusive pin: clear all, set next
+    pinnedSessionIds.clear();
+    Object.keys(pinnedSessionCwds).forEach(k => delete pinnedSessionCwds[k]);
+    pinnedSessionIds.add(next.id);
+    if (next.cwd) pinnedSessionCwds[next.id] = next.cwd;
+    _savePinnedSessions();
+    _resolvePinnedState();
+
+    // Flash session name on Clawd via renderer
+    const label = next.cwd ? next.cwd.split(/[\\/]/).pop() : next.id.slice(0, 8);
+    if (win && !win.isDestroyed()) {
+      win.webContents.send("show-toast", `📌 ${label}`);
+    }
+  });
+
   _chat.registerIpc();
   _response.registerIpc();
 
