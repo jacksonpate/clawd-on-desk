@@ -246,6 +246,8 @@ function show() {
     reposition();
     chatWin.show();
     chatWin.focus();
+    // Freeze Clawd while chat bubble is open
+    if (ctx.freezeFollower) ctx.freezeFollower();
   });
 
   chatWin.on("blur", () => {
@@ -257,7 +259,11 @@ function show() {
     }, 150);
   });
 
-  chatWin.on("closed", () => { chatWin = null; });
+  chatWin.on("closed", () => {
+    chatWin = null;
+    // Unfreeze Clawd when bubble closes
+    if (ctx.unfreezeFollower) ctx.unfreezeFollower();
+  });
 }
 
 function hide() {

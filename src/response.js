@@ -122,6 +122,14 @@ function registerIpc() {
 
   ipcMain.on("response-close", () => hide());
 
+  ipcMain.on("response-pin", () => {
+    // Cancel auto-dismiss, send pin signal to renderer
+    clearTimeout(autoTimer);
+    if (responseWin && !responseWin.isDestroyed()) {
+      responseWin.webContents.send("response-pin");
+    }
+  });
+
   ipcMain.on("response-height", (_, h) => {
     measuredH = h;
     reposition();

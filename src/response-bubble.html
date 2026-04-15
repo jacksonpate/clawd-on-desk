@@ -165,9 +165,21 @@ window.responseAPI.onHide(() => {
   progressBar.classList.remove("running");
 });
 
-// Click anywhere on card to dismiss
-card.addEventListener("click", () => {
-  window.responseAPI.close();
+window.responseAPI.onPin(() => {
+  progressBar.classList.remove("running");
+  // Small visual indicator that it's pinned — dim the progress bar area
+  progressBar.style.opacity = "0.3";
+});
+
+// Left-click to dismiss
+card.addEventListener("click", (e) => {
+  if (e.button === 0) window.responseAPI.close();
+});
+
+// Right-click to pin (stay open indefinitely)
+card.addEventListener("contextmenu", (e) => {
+  e.preventDefault();
+  window.responseAPI.pin();
 });
 </script>
 </body>
