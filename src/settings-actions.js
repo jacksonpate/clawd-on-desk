@@ -100,6 +100,69 @@ function requirePlainObject(key) {
   };
 }
 
+function isPlainObject(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+const THEME_OVERRIDE_RESERVED_KEYS = new Set(["states", "tiers", "timings"]);
+const TIER_OVERRIDE_GROUPS = new Set(["workingTiers", "jugglingTiers"]);
+
+function cloneStateOverrides(themeMap) {
+  const out = {};
+  if (!isPlainObject(themeMap)) return out;
+  if (isPlainObject(themeMap.states)) {
+    for (const [stateKey, entry] of Object.entries(themeMap.states)) {
+      if (isPlainObject(entry)) out[stateKey] = { ...entry };
+    }
+  }
+  for (const [key, entry] of Object.entries(themeMap)) {
+    if (THEME_OVERRIDE_RESERVED_KEYS.has(key)) continue;
+    if (!out[key] && isPlainObject(entry)) out[key] = { ...entry };
+  }
+  return out;
+}
+
+function cloneTierOverrides(themeMap, tierGroup) {
+  const out = {};
+  if (!isPlainObject(themeMap) || !isPlainObject(themeMap.tiers)) return out;
+  const group = themeMap.tiers[tierGroup];
+  if (!isPlainObject(group)) return out;
+  for (const [originalFile, entry] of Object.entries(group)) {
+    if (isPlainObject(entry)) out[originalFile] = { ...entry };
+  }
+  return out;
+}
+
+function cloneAutoReturnOverrides(themeMap) {
+  const out = {};
+  if (!isPlainObject(themeMap) || !isPlainObject(themeMap.timings)) return out;
+  const autoReturn = themeMap.timings.autoReturn;
+  if (!isPlainObject(autoReturn)) return out;
+  for (const [stateKey, value] of Object.entries(autoReturn)) {
+    if (typeof value === "number" && Number.isFinite(value)) out[stateKey] = value;
+  }
+  return out;
+}
+
+function buildThemeOverrideMap({ states, workingTiers, jugglingTiers, autoReturn }) {
+  const out = {};
+  if (states && Object.keys(states).length > 0) out.states = states;
+  const tiers = {};
+  if (workingTiers && Object.keys(workingTiers).length > 0) tiers.workingTiers = workingTiers;
+  if (jugglingTiers && Object.keys(jugglingTiers).length > 0) tiers.jugglingTiers = jugglingTiers;
+  if (Object.keys(tiers).length > 0) out.tiers = tiers;
+  if (autoReturn && Object.keys(autoReturn).length > 0) out.timings = { autoReturn };
+  return out;
+}
+
+function normalizeTransitionPayload(transition) {
+  if (!isPlainObject(transition)) return null;
+  const out = {};
+  if (typeof transition.in === "number" && Number.isFinite(transition.in) && transition.in >= 0) out.in = transition.in;
+  if (typeof transition.out === "number" && Number.isFinite(transition.out) && transition.out >= 0) out.out = transition.out;
+  return Object.keys(out).length > 0 ? out : null;
+}
+
 // ── updateRegistry ──
 // Maps prefs field name → validator. Controller looks up by key and runs.
 
@@ -142,6 +205,9 @@ const updateRegistry = {
   autoStartWithClaude: {
     validate: requireBoolean("autoStartWithClaude"),
     effect(value, deps) {
+      if (deps && deps.snapshot && deps.snapshot.manageClaudeHooksAutomatically === false) {
+        return { status: "ok", noop: true };
+      }
       if (!deps || typeof deps.installAutoStart !== "function" || typeof deps.uninstallAutoStart !== "function") {
         return {
           status: "error",
@@ -156,6 +222,37 @@ const updateRegistry = {
         return {
           status: "error",
           message: `autoStartWithClaude: ${err && err.message}`,
+        };
+      }
+    },
+  },
+
+  manageClaudeHooksAutomatically: {
+    validate: requireBoolean("manageClaudeHooksAutomatically"),
+    effect(value, deps) {
+      if (
+        !deps
+        || typeof deps.syncClaudeHooksNow !== "function"
+        || typeof deps.startClaudeSettingsWatcher !== "function"
+        || typeof deps.stopClaudeSettingsWatcher !== "function"
+      ) {
+        return {
+          status: "error",
+          message: "manageClaudeHooksAutomatically effect requires syncClaudeHooksNow/startClaudeSettingsWatcher/stopClaudeSettingsWatcher deps",
+        };
+      }
+      try {
+        if (value) {
+          deps.syncClaudeHooksNow();
+          deps.startClaudeSettingsWatcher();
+        } else {
+          deps.stopClaudeSettingsWatcher();
+        }
+        return { status: "ok" };
+      } catch (err) {
+        return {
+          status: "error",
+          message: `manageClaudeHooksAutomatically: ${err && err.message}`,
         };
       }
     },
@@ -231,7 +328,9 @@ const updateRegistry = {
         };
       }
       try {
-        deps.activateTheme(value);
+        const snapshot = (deps && deps.snapshot) || {};
+        const currentOverrides = snapshot.themeOverrides || {};
+        deps.activateTheme(value, null, currentOverrides[value] || null);
         return { status: "ok" };
       } catch (err) {
         return {
@@ -245,6 +344,13 @@ const updateRegistry = {
   // ── Phase 2/3 placeholders — schema reserves these so applyUpdate accepts them ──
   agents: requirePlainObject("agents"),
   themeOverrides: requirePlainObject("themeOverrides"),
+
+  // Phase 3b-swap: per-theme variant selection. NO effect — the runtime switch
+  // runs through the `setThemeSelection` command which atomically commits
+  // `theme` + `themeVariant` after calling activateTheme(themeId, variantId).
+  // Letting this field have an effect would double-activate when the UI
+  // updates `theme` and `themeVariant` separately.
+  themeVariant: requirePlainObject("themeVariant"),
 
   // ── Internal — version is owned by prefs.js / migrate(), shouldn't normally
   //    be set via applyUpdate, but we accept it so programmatic upgrades work. ──
@@ -376,12 +482,70 @@ async function removeTheme(payload, deps) {
 
   const snapshot = deps.snapshot || {};
   const currentOverrides = snapshot.themeOverrides || {};
+  const currentVariantMap = snapshot.themeVariant || {};
+  const nextCommit = {};
   if (currentOverrides[themeId]) {
     const nextOverrides = { ...currentOverrides };
     delete nextOverrides[themeId];
-    return { status: "ok", commit: { themeOverrides: nextOverrides } };
+    nextCommit.themeOverrides = nextOverrides;
+  }
+  if (currentVariantMap[themeId] !== undefined) {
+    const nextVariantMap = { ...currentVariantMap };
+    delete nextVariantMap[themeId];
+    nextCommit.themeVariant = nextVariantMap;
+  }
+  if (Object.keys(nextCommit).length > 0) {
+    return { status: "ok", commit: nextCommit };
   }
   return { status: "ok" };
+}
+
+// Phase 3b-swap: atomic theme + variant switch.
+//   payload: { themeId: string, variantId?: string }
+// Why a dedicated command vs. letting the `theme` field effect handle it:
+// the theme effect only commits `{theme}`, so the dirty "author deleted the
+// variant user had selected" scenario leaves `themeVariant[themeId]` pointing
+// at a dead variantId. Fix: call activateTheme which lenient-fallbacks unknown
+// variants, read back the actually-resolved variantId, and commit both fields.
+// See docs/plan-settings-panel-3b-swap.md §6.2 "Runtime 切换路径".
+const _validateSetThemeSelectionThemeId = requireString("setThemeSelection.themeId");
+function setThemeSelection(payload, deps) {
+  const themeId = typeof payload === "string" ? payload : (payload && payload.themeId);
+  const variantIdInput = (payload && typeof payload === "object") ? payload.variantId : null;
+  const idCheck = _validateSetThemeSelectionThemeId(themeId);
+  if (idCheck.status !== "ok") return idCheck;
+  if (variantIdInput != null && (typeof variantIdInput !== "string" || !variantIdInput)) {
+    return { status: "error", message: "setThemeSelection.variantId must be a non-empty string when provided" };
+  }
+
+  if (!deps || typeof deps.activateTheme !== "function") {
+    return { status: "error", message: "setThemeSelection effect requires activateTheme dep" };
+  }
+
+  const snapshot = deps.snapshot || {};
+  const currentVariantMap = snapshot.themeVariant || {};
+  const currentOverrides = snapshot.themeOverrides || {};
+  const targetVariant = variantIdInput || currentVariantMap[themeId] || "default";
+  const targetOverrideMap = currentOverrides[themeId] || null;
+
+  let resolved;
+  try {
+    resolved = deps.activateTheme(themeId, targetVariant, targetOverrideMap);
+  } catch (err) {
+    return { status: "error", message: `setThemeSelection: ${err && err.message}` };
+  }
+  // activateTheme returns { themeId, variantId } — the variantId here reflects
+  // lenient fallback (dead variant → "default"). We commit the resolved value
+  // so prefs self-heal away from stale ids.
+  const resolvedVariant = (resolved && typeof resolved === "object" && typeof resolved.variantId === "string")
+    ? resolved.variantId
+    : targetVariant;
+
+  const nextVariantMap = { ...currentVariantMap, [themeId]: resolvedVariant };
+  return {
+    status: "ok",
+    commit: { theme: themeId, themeVariant: nextVariantMap },
+  };
 }
 
 // Phase 3b: 仅允许 override 这 5 个"打扰态"——其他 state 要么不走 theme.states
@@ -412,35 +576,160 @@ function setThemeOverrideDisabled(payload, deps) {
   const snapshot = (deps && deps.snapshot) || {};
   const currentOverrides = snapshot.themeOverrides || {};
   const currentThemeMap = currentOverrides[themeId] || {};
-  const currentEntry = currentThemeMap[stateKey];
+  const currentStates = cloneStateOverrides(currentThemeMap);
+  const currentEntry = currentStates[stateKey];
   const currentDisabled = !!(currentEntry && currentEntry.disabled === true);
   if (currentDisabled === disabled) {
     return { status: "ok", noop: true };
   }
 
-  const nextThemeMap = { ...currentThemeMap };
+  const nextStates = { ...currentStates };
   if (disabled) {
-    nextThemeMap[stateKey] = { disabled: true };
+    nextStates[stateKey] = { ...(currentEntry || {}), disabled: true };
   } else {
-    // disabled=false：若原条目只有 disabled 就删掉；若同时带 sourceThemeId/file
-    // （Phase 3b-ext 格式）就脱掉 disabled 保留其余字段。normalizeThemeOverrides
-    // 自身会把孤立的 disabled:false 折叠成 file 形态或丢弃，这里依赖那层兜底。
-    if (currentEntry && typeof currentEntry.sourceThemeId === "string" && typeof currentEntry.file === "string") {
-      nextThemeMap[stateKey] = {
-        sourceThemeId: currentEntry.sourceThemeId,
-        file: currentEntry.file,
-      };
-    } else {
-      delete nextThemeMap[stateKey];
-    }
+    const preserved = { ...(currentEntry || {}) };
+    delete preserved.disabled;
+    if (Object.keys(preserved).length > 0) nextStates[stateKey] = preserved;
+    else delete nextStates[stateKey];
   }
 
+  const nextThemeMap = buildThemeOverrideMap({
+    states: nextStates,
+    workingTiers: cloneTierOverrides(currentThemeMap, "workingTiers"),
+    jugglingTiers: cloneTierOverrides(currentThemeMap, "jugglingTiers"),
+    autoReturn: cloneAutoReturnOverrides(currentThemeMap),
+  });
   const nextOverrides = { ...currentOverrides };
   if (Object.keys(nextThemeMap).length > 0) {
     nextOverrides[themeId] = nextThemeMap;
   } else {
     delete nextOverrides[themeId];
   }
+  return { status: "ok", commit: { themeOverrides: nextOverrides } };
+}
+
+const _validateAnimationOverrideThemeId = requireString("setAnimationOverride.themeId");
+function setAnimationOverride(payload, deps) {
+  if (!isPlainObject(payload)) {
+    return { status: "error", message: "setAnimationOverride: payload must be an object" };
+  }
+  const { themeId, slotType } = payload;
+  const idCheck = _validateAnimationOverrideThemeId(themeId);
+  if (idCheck.status !== "ok") return idCheck;
+  if (slotType !== "state" && slotType !== "tier") {
+    return { status: "error", message: "setAnimationOverride.slotType must be 'state' or 'tier'" };
+  }
+
+  const touchesFile = Object.prototype.hasOwnProperty.call(payload, "file");
+  const touchesTransition = Object.prototype.hasOwnProperty.call(payload, "transition");
+  const touchesAutoReturn = Object.prototype.hasOwnProperty.call(payload, "autoReturnMs");
+  if (!touchesFile && !touchesTransition && !touchesAutoReturn) {
+    return { status: "error", message: "setAnimationOverride must change file, transition, or autoReturnMs" };
+  }
+
+  if (touchesFile && payload.file !== null && (typeof payload.file !== "string" || !payload.file)) {
+    return { status: "error", message: "setAnimationOverride.file must be null or a non-empty string" };
+  }
+  if (touchesTransition && payload.transition !== null && !normalizeTransitionPayload(payload.transition)) {
+    return { status: "error", message: "setAnimationOverride.transition must contain finite non-negative in/out values" };
+  }
+  if (touchesAutoReturn && payload.autoReturnMs !== null) {
+    if (typeof payload.autoReturnMs !== "number" || !Number.isFinite(payload.autoReturnMs)) {
+      return { status: "error", message: "setAnimationOverride.autoReturnMs must be null or a finite number" };
+    }
+    if (payload.autoReturnMs < 500 || payload.autoReturnMs > 60000) {
+      return { status: "error", message: "setAnimationOverride.autoReturnMs must be between 500 and 60000" };
+    }
+  }
+
+  const snapshot = (deps && deps.snapshot) || {};
+  const currentOverrides = snapshot.themeOverrides || {};
+  const currentThemeMap = currentOverrides[themeId] || {};
+  const nextStates = cloneStateOverrides(currentThemeMap);
+  const nextWorkingTiers = cloneTierOverrides(currentThemeMap, "workingTiers");
+  const nextJugglingTiers = cloneTierOverrides(currentThemeMap, "jugglingTiers");
+  const nextAutoReturn = cloneAutoReturnOverrides(currentThemeMap);
+
+  if (slotType === "state") {
+    if (typeof payload.stateKey !== "string" || !payload.stateKey) {
+      return { status: "error", message: "setAnimationOverride.stateKey must be a non-empty string for state slots" };
+    }
+    const stateKey = payload.stateKey;
+    const nextEntry = { ...(nextStates[stateKey] || {}) };
+    if (touchesFile) {
+      if (payload.file === null) {
+        delete nextEntry.file;
+        delete nextEntry.sourceThemeId;
+      } else {
+        nextEntry.file = payload.file;
+      }
+    }
+    if (touchesTransition) {
+      if (payload.transition === null) delete nextEntry.transition;
+      else nextEntry.transition = normalizeTransitionPayload(payload.transition);
+    }
+    if (Object.keys(nextEntry).length > 0) nextStates[stateKey] = nextEntry;
+    else delete nextStates[stateKey];
+
+    if (touchesAutoReturn) {
+      if (payload.autoReturnMs === null) delete nextAutoReturn[stateKey];
+      else nextAutoReturn[stateKey] = payload.autoReturnMs;
+    }
+  } else {
+    const { tierGroup, originalFile } = payload;
+    if (!TIER_OVERRIDE_GROUPS.has(tierGroup)) {
+      return { status: "error", message: "setAnimationOverride.tierGroup must be workingTiers or jugglingTiers" };
+    }
+    if (typeof originalFile !== "string" || !originalFile) {
+      return { status: "error", message: "setAnimationOverride.originalFile must be a non-empty string for tier slots" };
+    }
+    if (touchesAutoReturn) {
+      return { status: "error", message: "setAnimationOverride.autoReturnMs is only supported for state slots" };
+    }
+    const tierMap = tierGroup === "workingTiers" ? nextWorkingTiers : nextJugglingTiers;
+    const nextEntry = { ...(tierMap[originalFile] || {}) };
+    if (touchesFile) {
+      if (payload.file === null) {
+        delete nextEntry.file;
+        delete nextEntry.sourceThemeId;
+      } else {
+        nextEntry.file = payload.file;
+      }
+    }
+    if (touchesTransition) {
+      if (payload.transition === null) delete nextEntry.transition;
+      else nextEntry.transition = normalizeTransitionPayload(payload.transition);
+    }
+    if (Object.keys(nextEntry).length > 0) tierMap[originalFile] = nextEntry;
+    else delete tierMap[originalFile];
+  }
+
+  const nextThemeMap = buildThemeOverrideMap({
+    states: nextStates,
+    workingTiers: nextWorkingTiers,
+    jugglingTiers: nextJugglingTiers,
+    autoReturn: nextAutoReturn,
+  });
+  const nextOverrides = { ...currentOverrides };
+  if (Object.keys(nextThemeMap).length > 0) nextOverrides[themeId] = nextThemeMap;
+  else delete nextOverrides[themeId];
+
+  if (JSON.stringify(nextOverrides) === JSON.stringify(currentOverrides)) {
+    return { status: "ok", noop: true };
+  }
+
+  const activeThemeId = snapshot.theme;
+  if (themeId === activeThemeId) {
+    if (!deps || typeof deps.activateTheme !== "function") {
+      return { status: "error", message: "setAnimationOverride effect requires activateTheme dep for the active theme" };
+    }
+    try {
+      deps.activateTheme(themeId, null, nextThemeMap);
+    } catch (err) {
+      return { status: "error", message: `setAnimationOverride: ${err && err.message}` };
+    }
+  }
+
   return { status: "ok", commit: { themeOverrides: nextOverrides } };
 }
 
@@ -455,19 +744,74 @@ function resetThemeOverrides(payload, deps) {
   if (!currentOverrides[themeId]) {
     return { status: "ok", noop: true };
   }
+
+  const activeThemeId = snapshot.theme;
+  if (themeId === activeThemeId) {
+    if (!deps || typeof deps.activateTheme !== "function") {
+      return { status: "error", message: "resetThemeOverrides effect requires activateTheme dep for the active theme" };
+    }
+    try {
+      deps.activateTheme(themeId, null, null);
+    } catch (err) {
+      return { status: "error", message: `resetThemeOverrides: ${err && err.message}` };
+    }
+  }
+
   const nextOverrides = { ...currentOverrides };
   delete nextOverrides[themeId];
   return { status: "ok", commit: { themeOverrides: nextOverrides } };
 }
 
+function installHooks(_payload, deps) {
+  if (!deps || typeof deps.syncClaudeHooksNow !== "function") {
+    return {
+      status: "error",
+      message: "installHooks requires syncClaudeHooksNow dep",
+    };
+  }
+  try {
+    deps.syncClaudeHooksNow();
+    return { status: "ok" };
+  } catch (err) {
+    return { status: "error", message: `installHooks: ${err && err.message}` };
+  }
+}
+
+function uninstallHooks(_payload, deps) {
+  if (
+    !deps
+    || typeof deps.uninstallClaudeHooksNow !== "function"
+    || typeof deps.stopClaudeSettingsWatcher !== "function"
+  ) {
+    return {
+      status: "error",
+      message: "uninstallHooks requires uninstallClaudeHooksNow and stopClaudeSettingsWatcher deps",
+    };
+  }
+
+  const shouldRestoreWatcher = !!(deps.snapshot && deps.snapshot.manageClaudeHooksAutomatically);
+  try {
+    deps.stopClaudeSettingsWatcher();
+    deps.uninstallClaudeHooksNow();
+    return { status: "ok", commit: { manageClaudeHooksAutomatically: false } };
+  } catch (err) {
+    if (shouldRestoreWatcher && typeof deps.startClaudeSettingsWatcher === "function") {
+      try { deps.startClaudeSettingsWatcher(); } catch {}
+    }
+    return { status: "error", message: `uninstallHooks: ${err && err.message}` };
+  }
+}
+
 const commandRegistry = {
   removeTheme,
-  installHooks: notImplemented("installHooks"),
-  uninstallHooks: notImplemented("uninstallHooks"),
+  installHooks,
+  uninstallHooks,
   registerShortcut: notImplemented("registerShortcut"),
   setAgentFlag,
+  setAnimationOverride,
   setThemeOverrideDisabled,
   resetThemeOverrides,
+  setThemeSelection,
 };
 
 module.exports = {

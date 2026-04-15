@@ -5,6 +5,9 @@
 <p align="center">
   <a href="README.md">English</a>
 </p>
+<p align="center">
+  <a href="https://github.com/hesreallyhim/awesome-claude-code"><img src="https://awesome.re/mentioned-badge-flat.svg" alt="Mentioned in Awesome Claude Code"></a>
+</p>
 
 一个能实时感知 AI 编程助手工作状态的桌面宠物。Clawd 住在你的屏幕上——你提问时它思考，工具运行时它打字，子代理工作时它杂耍，审批权限时它弹卡片，任务完成时它庆祝，你离开时它睡觉。内置两套主题：**Clawd**（像素螃蟹）和 **Calico**（三花猫），支持自定义主题。
 

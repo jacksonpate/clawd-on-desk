@@ -153,6 +153,7 @@ module.exports = function initMenu(ctx) {
         label: t("startWithClaude"),
         type: "checkbox",
         checked: ctx.autoStartWithClaude,
+        enabled: ctx.manageClaudeHooksAutomatically,
         // Setter triggers controller.applyUpdate; subscriber in main.js
         // installs/uninstalls the SessionStart hook + rebuilds the menu.
         click: (menuItem) => { ctx.autoStartWithClaude = menuItem.checked; },

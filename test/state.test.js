@@ -74,6 +74,7 @@ function rawSession(state, opts = {}) {
     host: opts.host || null,
     headless: opts.headless || false,
     pidReachable: opts.pidReachable ?? false,
+    resumeState: opts.resumeState || null,
   };
 }
 
@@ -501,10 +502,24 @@ describe("updateSession()", () => {
     assert.strictEqual(api.sessions.get("s1").state, "juggling");
   });
 
-  it("juggling + SubagentStop → downgrades to working", () => {
+  it("working + SubagentStart + SubagentStop → restores working", () => {
+    update(api, { id: "s1", state: "working", event: "PreToolUse" });
     update(api, { id: "s1", state: "juggling", event: "SubagentStart" });
     update(api, { id: "s1", state: "working", event: "SubagentStop" });
     assert.strictEqual(api.sessions.get("s1").state, "working");
+  });
+
+  it("subagent-only session is removed on SubagentStop", () => {
+    update(api, { id: "s1", state: "juggling", event: "SubagentStart" });
+    assert.ok(api.sessions.has("s1"));
+    update(api, { id: "s1", state: "working", event: "SubagentStop" });
+    assert.ok(!api.sessions.has("s1"));
+  });
+
+  it("late SubagentStop without tracked session is ignored", () => {
+    update(api, { id: "ghost", state: "working", event: "SubagentStop" });
+    assert.ok(!api.sessions.has("ghost"));
+    assert.strictEqual(api.getCurrentState(), "idle");
   });
 
   it("SessionEnd → deletes session", () => {

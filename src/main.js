@@ -1,8 +1,10 @@
-const { app, BrowserWindow, screen, Menu, ipcMain, globalShortcut, nativeTheme, dialog } = require("electron");
+const { app, BrowserWindow, screen, Menu, ipcMain, globalShortcut, nativeTheme, dialog, shell } = require("electron");
 const path = require("path");
 const fs = require("fs");
+const { pathToFileURL } = require("url");
 const { applyStationaryCollectionBehavior } = require("./mac-window");
 const hitGeometry = require("./hit-geometry");
+const animationCycle = require("./animation-cycle");
 const { findNearestWorkArea, computeLooseClamp, SYNTHETIC_WORK_AREA } = require("./work-area");
 const { getLaunchSizingWorkArea, getProportionalPixelSize } = require("./size-utils");
 
@@ -60,6 +62,10 @@ function _uninstallAutoStartHook() {
   const { unregisterAutoStart } = require("../hooks/install.js");
   unregisterAutoStart();
 }
+function _uninstallClaudeHooksNow() {
+  const { unregisterHooks } = require("../hooks/install.js");
+  unregisterHooks();
+}
 
 // Cross-platform "open at login" writer used by both the openAtLogin effect
 // and the startup hydration helper. Throws on failure so the action layer can
@@ -116,13 +122,20 @@ const _settingsController = createSettingsController({
   injectedDeps: {
     installAutoStart: _installAutoStartHook,
     uninstallAutoStart: _uninstallAutoStartHook,
+    syncClaudeHooksNow: () => _server.syncClawdHooks(),
+    uninstallClaudeHooksNow: _uninstallClaudeHooksNow,
+    startClaudeSettingsWatcher: () => _server.startClaudeSettingsWatcher(),
+    stopClaudeSettingsWatcher: () => _server.stopClaudeSettingsWatcher(),
     setOpenAtLogin: _writeSystemOpenAtLogin,
     startMonitorForAgent: _deferredStartMonitorForAgent,
     stopMonitorForAgent: _deferredStopMonitorForAgent,
     clearSessionsByAgent: _deferredClearSessionsByAgent,
     dismissPermissionsByAgent: _deferredDismissPermissionsByAgent,
     // Theme deps — defined much later in the file, wrapped in lazy closures.
-    activateTheme: (id) => _deferredActivateTheme(id),
+    // activateTheme accepts (themeId, variantId?, overrideMap?) and returns
+    // { themeId, variantId } with the actually-resolved variantId
+    // (lenient fallback on unknown variants).
+    activateTheme: (id, variantId, overrideMap) => _deferredActivateTheme(id, variantId, overrideMap),
     getThemeInfo: (id) => _deferredGetThemeInfo(id),
     removeThemeDir: (id) => _deferredRemoveThemeDir(id),
   },
@@ -199,12 +212,34 @@ const themeLoader = require("./theme-loader");
 themeLoader.init(__dirname, app.getPath("userData"));
 
 // Lenient load so a missing/corrupt user-selected theme can't brick boot.
-// If lenient fell back to "clawd", hydrate prefs to match so the store
-// stays truth.
+// If lenient fell back to "clawd" OR the variant fell back to "default",
+// hydrate prefs to match so the store stays truth.
+//
+// Startup runs BEFORE the window is ready, so we call themeLoader.loadTheme
+// directly — not activateTheme (which requires ready windows) and not the
+// setThemeSelection command (which goes through activateTheme). The runtime
+// switch path via UI goes through setThemeSelection post-window-ready.
 const _requestedThemeId = _settingsController.get("theme") || "clawd";
-let activeTheme = themeLoader.loadTheme(_requestedThemeId);
-if (activeTheme._id !== _requestedThemeId) {
-  const result = _settingsController.hydrate({ theme: activeTheme._id });
+const _initialVariantMap = _settingsController.get("themeVariant") || {};
+const _requestedVariantId = _initialVariantMap[_requestedThemeId] || "default";
+const _initialThemeOverrides = _settingsController.get("themeOverrides") || {};
+const _requestedThemeOverrides = _initialThemeOverrides[_requestedThemeId] || null;
+let activeTheme = themeLoader.loadTheme(_requestedThemeId, {
+  variant: _requestedVariantId,
+  overrides: _requestedThemeOverrides,
+});
+activeTheme._overrideSignature = JSON.stringify(_requestedThemeOverrides || {});
+if (activeTheme._id !== _requestedThemeId || activeTheme._variantId !== _requestedVariantId) {
+  const nextVariantMap = { ...(_settingsController.get("themeVariant") || {}) };
+  // Self-heal: store the resolved ids so next boot doesn't fall back again.
+  nextVariantMap[activeTheme._id] = activeTheme._variantId;
+  if (activeTheme._id !== _requestedThemeId) {
+    delete nextVariantMap[_requestedThemeId];
+  }
+  const result = _settingsController.hydrate({
+    theme: activeTheme._id,
+    themeVariant: nextVariantMap,
+  });
   if (result && result.status === "error") {
     console.warn("Clawd: theme hydrate after fallback failed:", result.message);
   }
@@ -259,6 +294,7 @@ let isQuitting = false;
 // directly (writes go through ctx setters → controller.applyUpdate).
 let showTray = _settingsController.get("showTray");
 let showDock = _settingsController.get("showDock");
+let manageClaudeHooksAutomatically = _settingsController.get("manageClaudeHooksAutomatically");
 let autoStartWithClaude = _settingsController.get("autoStartWithClaude");
 let openAtLogin = _settingsController.get("openAtLogin");
 let bubbleFollowPet = _settingsController.get("bubbleFollowPet");
@@ -350,6 +386,18 @@ function syncRendererStateAfterLoad({ includeStartupRecovery = true } = {}) {
     applyState("mini-idle");
     return;
   }
+
+  // Theme hot-reload path (override tweak / variant swap): re-render whatever
+  // we were already showing. Going through resolveDisplayState() here flashes
+  // "working/typing" when sessions Map still holds a stale session whose
+  // state hasn't been stale-downgraded yet — currentState already reflects
+  // the user-visible state before reload and stays authoritative.
+  if (!includeStartupRecovery) {
+    const prev = _state.getCurrentState();
+    applyState(prev, getSvgOverride(prev));
+    return;
+  }
+
   if (sessions.size > 0) {
     const resolved = resolveDisplayState();
     applyState(resolved, getSvgOverride(resolved));
@@ -357,7 +405,6 @@ function syncRendererStateAfterLoad({ includeStartupRecovery = true } = {}) {
   }
 
   applyState("idle", getSvgOverride("idle"));
-  if (!includeStartupRecovery) return;
 
   setTimeout(() => {
     if (sessions.size > 0 || doNotDisturb) return;
@@ -447,6 +494,7 @@ const { showPermissionBubble, resolvePermissionEntry, sendPermissionResponse, re
 const pendingPermissions = _perm.pendingPermissions;
 let permDebugLog = null; // set after app.whenReady()
 let updateDebugLog = null; // set after app.whenReady()
+let sessionDebugLog = null; // set after app.whenReady()
 
 const _updateBubbleCtx = {
   get win() { return win; },
@@ -532,6 +580,7 @@ const _stateCtx = {
   miniPeekOut: () => miniPeekOut(),
   buildContextMenu: () => buildContextMenu(),
   buildTrayMenu: () => buildTrayMenu(),
+  debugLog: (msg) => sessionLog(msg),
   // Phase 3b: 读 prefs.themeOverrides 判断某个 oneshot state 是否被用户禁用。
   // state.js gate 调这个做 early-return。不做白名单校验——settings-actions
   // 负责写入合法性，这里只读。
@@ -540,7 +589,8 @@ const _stateCtx = {
     if (!themeId || !stateKey) return false;
     const overrides = _settingsController.get("themeOverrides");
     const themeMap = overrides && overrides[themeId];
-    const entry = themeMap && themeMap[stateKey];
+    const stateMap = themeMap && themeMap.states;
+    const entry = (stateMap && stateMap[stateKey]) || (themeMap && themeMap[stateKey]);
     return !!(entry && entry.disabled === true);
   },
   hasAnyEnabledAgent: () => {
@@ -652,6 +702,7 @@ const _response = require("./response")({
 
 // ── HTTP server — delegated to src/server.js ──
 const _serverCtx = {
+  get manageClaudeHooksAutomatically() { return manageClaudeHooksAutomatically; },
   get autoStartWithClaude() { return autoStartWithClaude; },
   get doNotDisturb() { return doNotDisturb; },
   get hideBubbles() { return hideBubbles; },
@@ -748,6 +799,12 @@ function updateLog(msg) {
   rotatedAppend(updateDebugLog, `[${new Date().toISOString()}] ${msg}\n`);
 }
 
+function sessionLog(msg) {
+  if (!sessionDebugLog) return;
+  const { rotatedAppend } = require("./log-rotate");
+  rotatedAppend(sessionDebugLog, `[${new Date().toISOString()}] ${msg}\n`);
+}
+
 // ── Menu — delegated to src/menu.js ──
 //
 // Setters that previously assigned to module-level vars now route through
@@ -768,6 +825,7 @@ const _menuCtx = {
   set showTray(v) { _settingsController.applyUpdate("showTray", v); },
   get showDock() { return showDock; },
   set showDock(v) { _settingsController.applyUpdate("showDock", v); },
+  get manageClaudeHooksAutomatically() { return manageClaudeHooksAutomatically; },
   get autoStartWithClaude() { return autoStartWithClaude; },
   set autoStartWithClaude(v) { _settingsController.applyUpdate("autoStartWithClaude", v); },
   get openAtLogin() { return openAtLogin; },
@@ -838,7 +896,7 @@ const { t, buildContextMenu, buildTrayMenu, rebuildAllMenus, createTray,
 // from a future settings panel land here identically.
 const MENU_AFFECTING_KEYS = new Set([
   "lang", "soundMuted", "bubbleFollowPet", "hideBubbles", "showSessionId",
-  "autoStartWithClaude", "openAtLogin", "showTray", "showDock", "theme", "size",
+  "manageClaudeHooksAutomatically", "autoStartWithClaude", "openAtLogin", "showTray", "showDock", "theme", "size",
 ]);
 function wireSettingsSubscribers() {
   _settingsController.subscribe(({ changes }) => {
@@ -856,6 +914,9 @@ function wireSettingsSubscribers() {
       try { applyDockVisibility(); } catch (err) {
         console.warn("Clawd: applyDockVisibility failed:", err && err.message);
       }
+    }
+    if ("manageClaudeHooksAutomatically" in changes) {
+      manageClaudeHooksAutomatically = changes.manageClaudeHooksAutomatically;
     }
     // autoStartWithClaude / openAtLogin are object-form pre-commit gates in
     // settings-actions.js — by the time we get here the system call already
@@ -910,6 +971,279 @@ function wireSettingsSubscribers() {
 }
 wireSettingsSubscribers();
 
+const ANIMATION_OVERRIDE_ASSET_EXTS = new Set([".svg", ".gif", ".apng", ".png", ".webp"]);
+let animationOverridePreviewTimer = null;
+
+function _buildFileUrl(absPath) {
+  try { return pathToFileURL(absPath).href; }
+  catch { return null; }
+}
+
+function _resolveAnimationAssetAbsPath(filename) {
+  if (!filename || !activeTheme) return null;
+  try {
+    const absPath = themeLoader.getAssetPath(filename);
+    return absPath && fs.existsSync(absPath) ? absPath : null;
+  } catch {
+    return null;
+  }
+}
+
+function _resolveAnimationAssetsDir(theme = activeTheme) {
+  if (!theme) return null;
+  const themeAssetsDir = theme._themeDir ? path.join(theme._themeDir, "assets") : null;
+  if (themeAssetsDir && fs.existsSync(themeAssetsDir)) return themeAssetsDir;
+  const idleFile = theme.states && theme.states.idle && theme.states.idle[0];
+  if (!idleFile) return null;
+  const resolved = themeLoader.getAssetPath(idleFile);
+  return resolved ? path.dirname(resolved) : null;
+}
+
+function _buildAnimationAssetUrl(filename) {
+  const absPath = _resolveAnimationAssetAbsPath(filename);
+  return absPath ? _buildFileUrl(absPath) : null;
+}
+
+function _buildAnimationAssetProbe(file) {
+  const absPath = _resolveAnimationAssetAbsPath(file);
+  if (!absPath) {
+    return {
+      assetCycleMs: null,
+      assetCycleStatus: "unavailable",
+      assetCycleSource: null,
+    };
+  }
+  const probe = animationCycle.probeAssetCycle(absPath);
+  return {
+    assetCycleMs: Number.isFinite(probe && probe.ms) && probe.ms > 0 ? probe.ms : null,
+    assetCycleStatus: (probe && probe.status) || "unavailable",
+    assetCycleSource: (probe && probe.source) || null,
+  };
+}
+
+function _readCurrentThemeOverrideMap() {
+  const themeId = activeTheme && activeTheme._id;
+  if (!themeId || !_settingsController || typeof _settingsController.getSnapshot !== "function") return null;
+  const snapshot = _settingsController.getSnapshot();
+  return snapshot && snapshot.themeOverrides ? snapshot.themeOverrides[themeId] || null : null;
+}
+
+function _hasExplicitAutoReturnOverride(themeOverrideMap, stateKey) {
+  const autoReturn = themeOverrideMap && themeOverrideMap.timings && themeOverrideMap.timings.autoReturn;
+  return !!(autoReturn && Object.prototype.hasOwnProperty.call(autoReturn, stateKey));
+}
+
+function _buildTimingHint(file, fallbackMs = null) {
+  const assetProbe = _buildAnimationAssetProbe(file);
+  const suggestedDurationMs = assetProbe.assetCycleMs != null
+    ? assetProbe.assetCycleMs
+    : (Number.isFinite(fallbackMs) && fallbackMs > 0 ? fallbackMs : null);
+  const suggestedDurationStatus = assetProbe.assetCycleMs != null
+    ? assetProbe.assetCycleStatus
+    : (suggestedDurationMs != null ? "fallback" : "unavailable");
+  return {
+    ...assetProbe,
+    suggestedDurationMs,
+    suggestedDurationStatus,
+    previewDurationMs: suggestedDurationMs,
+  };
+}
+
+function _listAnimationOverrideAssets(theme = activeTheme) {
+  if (!theme) return [];
+  const dirs = [];
+  const primaryDir = _resolveAnimationAssetsDir(theme);
+  const sourceDir = theme._themeDir ? path.join(theme._themeDir, "assets") : null;
+  const cacheDir = theme._assetsDir || null;
+  for (const dir of [primaryDir, sourceDir, cacheDir]) {
+    if (!dir || !fs.existsSync(dir)) continue;
+    if (!dirs.includes(dir)) dirs.push(dir);
+  }
+  const seen = new Set();
+  const assets = [];
+  for (const dir of dirs) {
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { entries = []; }
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      const ext = path.extname(entry.name).toLowerCase();
+      if (!ANIMATION_OVERRIDE_ASSET_EXTS.has(ext)) continue;
+      if (seen.has(entry.name)) continue;
+      const absPath = _resolveAnimationAssetAbsPath(entry.name) || path.join(dir, entry.name);
+      const previewUrl = _buildFileUrl(absPath);
+      const probe = animationCycle.probeAssetCycle(absPath);
+      assets.push({
+        name: entry.name,
+        fileUrl: previewUrl,
+        ext,
+        cycleMs: Number.isFinite(probe && probe.ms) && probe.ms > 0 ? probe.ms : null,
+        cycleStatus: (probe && probe.status) || "unavailable",
+        cycleSource: (probe && probe.source) || null,
+      });
+      seen.add(entry.name);
+    }
+  }
+  assets.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
+  return assets;
+}
+
+function _readResolvedTransition(file) {
+  const entry = activeTheme && activeTheme.transitions && activeTheme.transitions[file];
+  return {
+    in: entry && Number.isFinite(entry.in) ? entry.in : 150,
+    out: entry && Number.isFinite(entry.out) ? entry.out : 150,
+  };
+}
+
+function _buildTierCardGroup(tierGroup, triggerKind, resolvedTiers, baseTiers, baseHintMap) {
+  if (!Array.isArray(resolvedTiers)) return [];
+  return resolvedTiers.map((tier, index) => {
+    const baseTier = Array.isArray(baseTiers) ? baseTiers[index] : null;
+    const originalFile = (baseTier && baseTier.originalFile) || tier.file;
+    const higherTier = index === 0 ? null : resolvedTiers[index - 1];
+    const maxSessions = higherTier ? Math.max(tier.minSessions, higherTier.minSessions - 1) : null;
+    const hintTarget = baseHintMap && baseHintMap[originalFile];
+    const timingHint = _buildTimingHint(tier.file);
+    return {
+      id: `${tierGroup}:${originalFile}`,
+      slotType: "tier",
+      tierGroup,
+      triggerKind,
+      originalFile,
+      baseFile: originalFile,
+      minSessions: tier.minSessions,
+      maxSessions,
+      currentFile: tier.file,
+      currentFileUrl: _buildAnimationAssetUrl(tier.file),
+      bindingLabel: `${tierGroup}[${originalFile}]`,
+      transition: _readResolvedTransition(tier.file),
+      supportsAutoReturn: false,
+      autoReturnMs: null,
+      hasAutoReturnOverride: false,
+      ...timingHint,
+      displayHintWarning: !!(hintTarget && hintTarget !== originalFile),
+      displayHintTarget: hintTarget || null,
+    };
+  });
+}
+
+function _buildStateCard(stateKey, triggerKind, themeOverrideMap) {
+  const files = activeTheme && activeTheme.states && activeTheme.states[stateKey];
+  if (!Array.isArray(files) || !files[0]) return null;
+  const currentFile = files[0];
+  const autoReturnMap = (activeTheme && activeTheme.timings && activeTheme.timings.autoReturn) || {};
+  const supportsAutoReturn = Object.prototype.hasOwnProperty.call(autoReturnMap, stateKey);
+  const resolvedAutoReturnMs = supportsAutoReturn ? autoReturnMap[stateKey] : null;
+  const timingHint = _buildTimingHint(currentFile, resolvedAutoReturnMs);
+  return {
+    id: `state:${stateKey}`,
+    slotType: "state",
+    stateKey,
+    triggerKind,
+    currentFile,
+    baseFile: (activeTheme._bindingBase && activeTheme._bindingBase.states && activeTheme._bindingBase.states[stateKey]) || currentFile,
+    currentFileUrl: _buildAnimationAssetUrl(currentFile),
+    bindingLabel: `states.${stateKey}[0]`,
+    transition: _readResolvedTransition(currentFile),
+    supportsAutoReturn,
+    autoReturnMs: resolvedAutoReturnMs,
+    hasAutoReturnOverride: supportsAutoReturn ? _hasExplicitAutoReturnOverride(themeOverrideMap, stateKey) : false,
+    ...timingHint,
+    displayHintWarning: false,
+    displayHintTarget: null,
+  };
+}
+
+function _buildAnimationOverrideCards() {
+  if (!activeTheme) return [];
+  const cards = [];
+  const themeOverrideMap = _readCurrentThemeOverrideMap();
+  const thinking = _buildStateCard("thinking", "thinking", themeOverrideMap);
+  if (thinking) cards.push(thinking);
+
+  const baseBindings = activeTheme._bindingBase || {};
+  cards.push(..._buildTierCardGroup(
+    "workingTiers",
+    "working",
+    activeTheme.workingTiers || [],
+    baseBindings.workingTiers || [],
+    baseBindings.displayHintMap || {}
+  ));
+  cards.push(..._buildTierCardGroup(
+    "jugglingTiers",
+    "juggling",
+    activeTheme.jugglingTiers || [],
+    baseBindings.jugglingTiers || [],
+    baseBindings.displayHintMap || {}
+  ));
+
+  for (const [stateKey, triggerKind] of [
+    ["error", "error"],
+    ["attention", "attention"],
+    ["notification", "notification"],
+    ["sweeping", "sweeping"],
+    ["carrying", "carrying"],
+    ["sleeping", "sleeping"],
+    ["waking", "waking"],
+  ]) {
+    const card = _buildStateCard(stateKey, triggerKind, themeOverrideMap);
+    if (card) cards.push(card);
+  }
+  return cards;
+}
+
+function _buildAnimationOverrideData() {
+  if (!activeTheme) return null;
+  const meta = themeLoader.getThemeMetadata(activeTheme._id) || {};
+  return {
+    theme: {
+      id: activeTheme._id,
+      name: meta.name || activeTheme._id,
+      variantId: activeTheme._variantId || "default",
+      assetsDir: _resolveAnimationAssetsDir(activeTheme),
+    },
+    assets: _listAnimationOverrideAssets(activeTheme),
+    cards: _buildAnimationOverrideCards(),
+  };
+}
+
+function _previewAnimationOverride(payload) {
+  if (!payload || typeof payload !== "object") {
+    return { status: "error", message: "previewAnimationOverride payload must be an object" };
+  }
+  const { stateKey, file, durationMs } = payload;
+  if (typeof stateKey !== "string" || !stateKey) {
+    return { status: "error", message: "previewAnimationOverride.stateKey must be a non-empty string" };
+  }
+  if (typeof file !== "string" || !file) {
+    return { status: "error", message: "previewAnimationOverride.file must be a non-empty string" };
+  }
+  if (!_state || typeof _state.applyState !== "function" || typeof _state.resolveDisplayState !== "function") {
+    return { status: "error", message: "previewAnimationOverride requires state runtime" };
+  }
+  if (animationOverridePreviewTimer) {
+    clearTimeout(animationOverridePreviewTimer);
+    animationOverridePreviewTimer = null;
+  }
+  try {
+    _state.applyState(stateKey, file);
+  } catch (err) {
+    return { status: "error", message: `previewAnimationOverride: ${err && err.message}` };
+  }
+  const fallbackMs = (activeTheme && activeTheme.timings && activeTheme.timings.autoReturn && activeTheme.timings.autoReturn[stateKey]) || 1800;
+  const holdMs = (typeof durationMs === "number" && Number.isFinite(durationMs) && durationMs >= 300)
+    ? durationMs
+    : fallbackMs;
+  animationOverridePreviewTimer = setTimeout(() => {
+    animationOverridePreviewTimer = null;
+    try {
+      const resolved = _state.resolveDisplayState();
+      _state.applyState(resolved, _state.getSvgOverride(resolved));
+    } catch {}
+  }, holdMs);
+  return { status: "ok" };
+}
+
 // ── IPC: settings panel write entry points ──
 // Renderer-side callers (the future settings panel) use these. Menu/main code
 // in this process calls _settingsController directly — no IPC round-trip.
@@ -926,6 +1260,17 @@ ipcMain.handle("settings:command", async (_event, payload) => {
   }
   return _settingsController.applyCommand(payload.action, payload.payload);
 });
+ipcMain.handle("settings:get-animation-overrides-data", () => _buildAnimationOverrideData());
+ipcMain.handle("settings:open-theme-assets-dir", async () => {
+  const dir = _resolveAnimationAssetsDir(activeTheme);
+  if (!dir || !fs.existsSync(dir)) {
+    return { status: "error", message: "theme assets directory unavailable" };
+  }
+  const result = await shell.openPath(dir);
+  if (result) return { status: "error", message: result };
+  return { status: "ok", path: dir };
+});
+ipcMain.handle("settings:preview-animation-override", (_event, payload) => _previewAnimationOverride(payload));
 
 // Static metadata for the Agents tab: name, eventSource, capabilities.
 // The renderer uses this (alongside the agents snapshot field) to render one
@@ -979,6 +1324,70 @@ ipcMain.handle("settings:confirm-remove-theme", async (event, themeId) => {
     return { confirmed: response === 0 };
   } catch (err) {
     console.warn("Clawd: confirm-remove-theme dialog failed:", err && err.message);
+    return { confirmed: false };
+  }
+});
+
+const CLAUDE_HOOKS_DIALOG_STRINGS = {
+  en: {
+    disableTitle: "Turn off automatic Claude hook management?",
+    disableDetail: "Existing Claude hooks in ~/.claude/settings.json stay in place unless you remove them now.",
+    disableOnly: "Disable automatic management only",
+    disableAndRemove: "Disable and remove installed hooks",
+    cancel: "Cancel",
+    disconnectTitle: "Disconnect Claude hooks?",
+    disconnectDetail: "This removes Clawd-managed Claude hooks from ~/.claude/settings.json and turns off automatic management. Your Start with Claude preference will be kept for later re-enable.",
+    disconnect: "Disconnect hooks",
+  },
+  zh: {
+    disableTitle: "关闭 Claude hooks 自动管理？",
+    disableDetail: "如果不选择立即移除，`~/.claude/settings.json` 里当前已安装的 Claude hooks 会继续保留。",
+    disableOnly: "只关闭自动管理",
+    disableAndRemove: "关闭并移除当前 hooks",
+    cancel: "取消",
+    disconnectTitle: "断开 Claude hooks？",
+    disconnectDetail: "这会从 `~/.claude/settings.json` 移除 Clawd 管理的 Claude hooks，并关闭自动管理。`随 Claude Code 启动` 的偏好会保留，方便以后重新启用。",
+    disconnect: "断开 hooks",
+  },
+};
+function _getSettingsDialogParent(event) {
+  return BrowserWindow.fromWebContents(event.sender) || settingsWindow || null;
+}
+ipcMain.handle("settings:confirm-disable-claude-hooks", async (event) => {
+  const s = CLAUDE_HOOKS_DIALOG_STRINGS[lang] || CLAUDE_HOOKS_DIALOG_STRINGS.en;
+  try {
+    const { response } = await dialog.showMessageBox(_getSettingsDialogParent(event), {
+      type: "warning",
+      buttons: [s.disableAndRemove, s.disableOnly, s.cancel],
+      defaultId: 1,
+      cancelId: 2,
+      message: s.disableTitle,
+      detail: s.disableDetail,
+      noLink: true,
+    });
+    if (response === 0) return { choice: "disconnect" };
+    if (response === 1) return { choice: "disable" };
+    return { choice: "cancel" };
+  } catch (err) {
+    console.warn("Clawd: confirm-disable-claude-hooks dialog failed:", err && err.message);
+    return { choice: "cancel" };
+  }
+});
+ipcMain.handle("settings:confirm-disconnect-claude-hooks", async (event) => {
+  const s = CLAUDE_HOOKS_DIALOG_STRINGS[lang] || CLAUDE_HOOKS_DIALOG_STRINGS.en;
+  try {
+    const { response } = await dialog.showMessageBox(_getSettingsDialogParent(event), {
+      type: "warning",
+      buttons: [s.disconnect, s.cancel],
+      defaultId: 1,
+      cancelId: 1,
+      message: s.disconnectTitle,
+      detail: s.disconnectDetail,
+      noLink: true,
+    });
+    return { confirmed: response === 0 };
+  } catch (err) {
+    console.warn("Clawd: confirm-disconnect-claude-hooks dialog failed:", err && err.message);
     return { confirmed: false };
   }
 });
@@ -1486,14 +1895,42 @@ Object.defineProperties(this || {}, {}); // no-op placeholder
 // controller rejects the commit — otherwise prefs would record a theme id
 // that can't actually render. Does NOT write `theme` back to prefs; the
 // controller commits after this returns (writing here would infinite-loop).
-function activateTheme(themeId) {
+function activateTheme(themeId, variantId) {
   if (!win || win.isDestroyed()) {
     throw new Error("theme switch requires ready windows");
   }
-  if (activeTheme && activeTheme._id === themeId) return;
+  // Resolve variantId: explicit arg wins; else current per-theme preference; else default.
+  // (Unknown variants lenient-fallback inside loadTheme, so we still commit strict on themeId.)
+  const currentVariantMap = _settingsController.get("themeVariant") || {};
+  const targetVariant = (typeof variantId === "string" && variantId) ? variantId
+    : (currentVariantMap[themeId] || "default");
+  const currentOverrides = _settingsController.get("themeOverrides") || {};
+  const targetOverrideMap = arguments.length >= 3 ? arguments[2] : (currentOverrides[themeId] || null);
+  const targetOverrideSignature = JSON.stringify(targetOverrideMap || {});
+
+  // Joint dedup: same theme + same variant → skip reload. Different variant
+  // on same theme MUST run the full reload pipeline (can't hot-patch tiers /
+  // displayHint / geometry safely — see plan-settings-panel-3b-swap.md §6.2).
+  if (
+    activeTheme &&
+    activeTheme._id === themeId &&
+    activeTheme._variantId === targetVariant &&
+    (activeTheme._overrideSignature || "{}") === targetOverrideSignature
+  ) {
+    return { themeId, variantId: activeTheme._variantId };
+  }
 
   // Strict load first: if it throws, nothing downstream has mutated yet.
-  const newTheme = themeLoader.loadTheme(themeId, { strict: true });
+  const newTheme = themeLoader.loadTheme(themeId, {
+    strict: true,
+    variant: targetVariant,
+    overrides: targetOverrideMap,
+  });
+  newTheme._overrideSignature = targetOverrideSignature;
+  if (animationOverridePreviewTimer) {
+    clearTimeout(animationOverridePreviewTimer);
+    animationOverridePreviewTimer = null;
+  }
 
   _state.cleanup();
   _tick.cleanup();
@@ -1532,13 +1969,17 @@ function activateTheme(themeId) {
   hitWin.webContents.once("did-finish-load", onReady);
 
   flushRuntimeStateToPrefs();
+
+  // Return resolved ids so the caller (setThemeSelection command) can commit
+  // the actually-loaded variantId — handles "author deleted variant" dirty state.
+  return { themeId, variantId: newTheme._variantId };
 }
 
 // Inject theme deps into the settings controller now that activateTheme,
 // themeLoader, and activeTheme are all defined. Uses lazy closures because
 // these references are captured at call time (inside an effect or command).
-function _deferredActivateTheme(themeId) {
-  return activateTheme(themeId);
+function _deferredActivateTheme(themeId, variantId, overrideMap) {
+  return activateTheme(themeId, variantId, overrideMap);
 }
 function _deferredGetThemeInfo(themeId) {
   const all = themeLoader.discoverThemes();
@@ -1646,6 +2087,7 @@ if (!gotTheLock) {
 
     permDebugLog = path.join(app.getPath("userData"), "permission-debug.log");
     updateDebugLog = path.join(app.getPath("userData"), "update-debug.log");
+    sessionDebugLog = path.join(app.getPath("userData"), "session-debug.log");
     createWindow();
 
     // Register global shortcut for toggling pet visibility

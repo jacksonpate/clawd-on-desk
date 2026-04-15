@@ -355,6 +355,24 @@ function pickDisplayHint(state, existing, incoming) {
   return existing && existing.displayHint != null ? existing.displayHint : null;
 }
 
+function debugSession(msg) {
+  if (typeof ctx.debugLog !== "function") return;
+  try { ctx.debugLog(msg); } catch {}
+}
+
+function describeSession(sessionId, session) {
+  if (!session) return `sid=${sessionId} <deleted>`;
+  return [
+    `sid=${sessionId}`,
+    `state=${session.state || "-"}`,
+    `resume=${session.resumeState || "-"}`,
+    `agent=${session.agentId || "-"}`,
+    `agentPid=${session.agentPid || "-"}`,
+    `sourcePid=${session.sourcePid || "-"}`,
+    `headless=${session.headless ? 1 : 0}`,
+  ].join(" ");
+}
+
 // ── Session management ──
 function updateSession(sessionId, state, event, sourcePid, cwd, editor, pidChain, agentPid, agentId, host, headless, displayHint) {
   if (startupRecoveryActive) {
@@ -376,6 +394,11 @@ function updateSession(sessionId, state, event, sourcePid, cwd, editor, pidChain
   const srcAgentId = agentId || (existing && existing.agentId) || null;
   const srcHost = host || (existing && existing.host) || null;
   const srcHeadless = headless || (existing && existing.headless) || false;
+  const srcResumeState = (existing && existing.resumeState) || null;
+  const isSubagentStart = event === "SubagentStart" || event === "subagentStart";
+  const isSubagentStop = event === "SubagentStop" || event === "subagentStop";
+
+  debugSession(`event ${describeSession(sessionId, existing)} -> incoming=${state}/${event || "-"} hint=${displayHint || "-"}`);
 
   const pidReachable = existing ? existing.pidReachable :
     (srcAgentPid ? isProcessAlive(srcAgentPid) : (srcPid ? isProcessAlive(srcPid) : false));
@@ -391,9 +414,41 @@ function updateSession(sessionId, state, event, sourcePid, cwd, editor, pidChain
     if (oldestId) sessions.delete(oldestId);
   }
 
+  if (isSubagentStop) {
+    if (!existing) {
+      debugSession(`subagent-stop ignore sid=${sessionId} reason=no-session`);
+      cleanStaleSessions();
+      const displayState = resolveDisplayState();
+      setState(displayState, getSvgOverride(displayState));
+      return;
+    }
+
+    if (existing.state === "juggling") {
+      const resumeState = existing.resumeState || null;
+      if (resumeState) {
+        const dh = pickDisplayHint(resumeState, existing, displayHint);
+        sessions.set(sessionId, { state: resumeState, updatedAt: Date.now(), displayHint: dh, ...base, resumeState: null });
+        debugSession(`subagent-stop restore ${describeSession(sessionId, sessions.get(sessionId))}`);
+      } else {
+        sessions.delete(sessionId);
+        debugSession(`subagent-stop delete sid=${sessionId} reason=no-resume`);
+      }
+    } else {
+      const dh = pickDisplayHint(existing.state, existing, displayHint);
+      sessions.set(sessionId, { state: existing.state, updatedAt: Date.now(), displayHint: dh, ...base, resumeState: null });
+      debugSession(`subagent-stop keep ${describeSession(sessionId, sessions.get(sessionId))}`);
+    }
+
+    cleanStaleSessions();
+    const displayState = resolveDisplayState();
+    setState(displayState, getSvgOverride(displayState));
+    return;
+  }
+
   if (event === "SessionEnd") {
     const endingSession = sessions.get(sessionId);
     sessions.delete(sessionId);
+    debugSession(`session-end delete ${describeSession(sessionId, endingSession)}`);
     cleanStaleSessions();
     if (!endingSession || !endingSession.headless) {
       let hasLiveInteractive = false;
@@ -415,26 +470,33 @@ function updateSession(sessionId, state, event, sourcePid, cwd, editor, pidChain
     setState(displayState, getSvgOverride(displayState));
     return;
   } else if (state === "attention" || state === "notification" || SLEEP_SEQUENCE.has(state)) {
-    sessions.set(sessionId, { state: "idle", updatedAt: Date.now(), displayHint: null, ...base });
+    sessions.set(sessionId, { state: "idle", updatedAt: Date.now(), displayHint: null, ...base, resumeState: null });
   } else if (ONESHOT_STATES.has(state)) {
     if (existing) {
       existing.updatedAt = Date.now();
       existing.displayHint = null;
+      existing.resumeState = null;
       if (sourcePid) existing.sourcePid = sourcePid;
       if (cwd) existing.cwd = cwd;
       if (editor) existing.editor = editor;
       if (pidChain && pidChain.length) existing.pidChain = pidChain;
       if (agentPid) existing.agentPid = agentPid;
     } else {
-      sessions.set(sessionId, { state: "idle", updatedAt: Date.now(), displayHint: null, ...base });
+      sessions.set(sessionId, { state: "idle", updatedAt: Date.now(), displayHint: null, ...base, resumeState: null });
     }
   } else {
-    if (existing && existing.state === "juggling" && state === "working" && event !== "SubagentStop" && event !== "subagentStop") {
+    if (isSubagentStart) {
+      const dh = pickDisplayHint(state, existing, displayHint);
+      const resumeState = existing && existing.state !== "juggling" ? existing.state : srcResumeState;
+      sessions.set(sessionId, { state, updatedAt: Date.now(), displayHint: dh, ...base, resumeState });
+      debugSession(`subagent-start store ${describeSession(sessionId, sessions.get(sessionId))}`);
+    } else if (existing && existing.state === "juggling" && state === "working") {
       existing.updatedAt = Date.now();
       existing.displayHint = pickDisplayHint("juggling", existing, displayHint);
+      debugSession(`juggling-hold ${describeSession(sessionId, existing)} event=${event || "-"}`);
     } else {
       const dh = pickDisplayHint(state, existing, displayHint);
-      sessions.set(sessionId, { state, updatedAt: Date.now(), displayHint: dh, ...base });
+      sessions.set(sessionId, { state, updatedAt: Date.now(), displayHint: dh, ...base, resumeState: null });
     }
   }
   cleanStaleSessions();
@@ -460,6 +522,7 @@ function cleanStaleSessions() {
     const age = now - s.updatedAt;
 
     if (s.pidReachable && s.agentPid && !isProcessAlive(s.agentPid)) {
+      debugSession(`stale-delete agent-exit ${describeSession(id, s)}`);
       if (!s.headless) removedNonHeadless = true;
       sessions.delete(id); changed = true;
       continue;
@@ -468,23 +531,29 @@ function cleanStaleSessions() {
     if (age > SESSION_STALE_MS) {
       if (s.pidReachable && s.sourcePid) {
         if (!isProcessAlive(s.sourcePid)) {
+          debugSession(`stale-delete source-exit ${describeSession(id, s)}`);
           if (!s.headless) removedNonHeadless = true;
           sessions.delete(id); changed = true;
         } else if (s.state !== "idle") {
+          debugSession(`stale-idle session-timeout ${describeSession(id, s)}`);
           s.state = "idle"; s.displayHint = null; changed = true;
         }
       } else if (!s.pidReachable) {
+        debugSession(`stale-delete unreachable ${describeSession(id, s)}`);
         if (!s.headless) removedNonHeadless = true;
         sessions.delete(id); changed = true;
       } else {
+        debugSession(`stale-delete no-source ${describeSession(id, s)}`);
         if (!s.headless) removedNonHeadless = true;
         sessions.delete(id); changed = true;
       }
     } else if (age > WORKING_STALE_MS) {
       if (s.pidReachable && s.sourcePid && !isProcessAlive(s.sourcePid)) {
+        debugSession(`stale-delete working-source-exit ${describeSession(id, s)}`);
         if (!s.headless) removedNonHeadless = true;
         sessions.delete(id); changed = true;
       } else if (s.state === "working" || s.state === "juggling" || s.state === "thinking") {
+        debugSession(`stale-idle working-timeout ${describeSession(id, s)}`);
         s.state = "idle"; s.displayHint = null; s.updatedAt = now; changed = true;
       }
     }

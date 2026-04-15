@@ -32,15 +32,55 @@ function shouldBypassOpencodeBubble(ctx) {
 
 module.exports = function initServer(ctx) {
 
+const fsApi = ctx.fs || fs;
+const pathApi = ctx.path || path;
+const osApi = ctx.os || os;
+const createHttpServer = ctx.createHttpServer || http.createServer.bind(http);
+const setImmediateFn = ctx.setImmediate || setImmediate;
+const setTimeoutFn = ctx.setTimeout || setTimeout;
+const clearTimeoutFn = ctx.clearTimeout || clearTimeout;
+const nowFn = typeof ctx.now === "function" ? ctx.now : Date.now;
+const clearRuntimeConfigFn = ctx.clearRuntimeConfig || clearRuntimeConfig;
+const getPortCandidatesFn = ctx.getPortCandidates || getPortCandidates;
+const readRuntimePortFn = ctx.readRuntimePort || readRuntimePort;
+const writeRuntimeConfigFn = ctx.writeRuntimeConfig || writeRuntimeConfig;
+const settingsWatchDebounceMs = Number.isFinite(ctx.settingsWatchDebounceMs) ? ctx.settingsWatchDebounceMs : 1000;
+const settingsWatchRateLimitMs = Number.isFinite(ctx.settingsWatchRateLimitMs) ? ctx.settingsWatchRateLimitMs : 5000;
+
 let httpServer = null;
 let activeServerPort = null;
+let settingsWatcher = null;
+let settingsWatchDebounceTimer = null;
+let settingsWatchLastSyncTime = 0;
+
+function shouldManageClaudeHooks() {
+  return ctx.manageClaudeHooksAutomatically !== false;
+}
+
+function getClaudeSettingsDir() {
+  return typeof ctx.claudeSettingsDir === "string"
+    ? ctx.claudeSettingsDir
+    : pathApi.join(osApi.homedir(), ".claude");
+}
+
+function getClaudeSettingsPath() {
+  return typeof ctx.claudeSettingsPath === "string"
+    ? ctx.claudeSettingsPath
+    : pathApi.join(getClaudeSettingsDir(), SETTINGS_FILENAME);
+}
 
 function getHookServerPort() {
-  return activeServerPort || readRuntimePort() || DEFAULT_SERVER_PORT;
+  return activeServerPort || readRuntimePortFn() || DEFAULT_SERVER_PORT;
 }
 
 function syncClawdHooks() {
   try {
+    if (typeof ctx.syncClawdHooksImpl === "function") {
+      return ctx.syncClawdHooksImpl({
+        autoStart: ctx.autoStartWithClaude,
+        port: getHookServerPort(),
+      });
+    }
     const { registerHooks } = require("../hooks/install.js");
     const { added, updated, removed } = registerHooks({
       silent: true,
@@ -57,6 +97,7 @@ function syncClawdHooks() {
 
 function syncGeminiHooks() {
   try {
+    if (typeof ctx.syncGeminiHooksImpl === "function") return ctx.syncGeminiHooksImpl();
     const { registerGeminiHooks } = require("../hooks/gemini-install.js");
     const { added, updated } = registerGeminiHooks({ silent: true });
     if (added > 0 || updated > 0) {
@@ -69,6 +110,7 @@ function syncGeminiHooks() {
 
 function syncCodeBuddyHooks() {
   try {
+    if (typeof ctx.syncCodeBuddyHooksImpl === "function") return ctx.syncCodeBuddyHooksImpl();
     const { registerCodeBuddyHooks } = require("../hooks/codebuddy-install.js");
     const { added, updated } = registerCodeBuddyHooks({ silent: true });
     if (added > 0 || updated > 0) {
@@ -81,6 +123,7 @@ function syncCodeBuddyHooks() {
 
 function syncKiroHooks() {
   try {
+    if (typeof ctx.syncKiroHooksImpl === "function") return ctx.syncKiroHooksImpl();
     const { registerKiroHooks } = require("../hooks/kiro-install.js");
     const { added, updated } = registerKiroHooks({ silent: true });
     if (added > 0 || updated > 0) {
@@ -93,6 +136,7 @@ function syncKiroHooks() {
 
 function syncCursorHooks() {
   try {
+    if (typeof ctx.syncCursorHooksImpl === "function") return ctx.syncCursorHooksImpl();
     const { registerCursorHooks } = require("../hooks/cursor-install.js");
     const { added, updated } = registerCursorHooks({ silent: true });
     if (added > 0 || updated > 0) {
@@ -105,6 +149,7 @@ function syncCursorHooks() {
 
 function syncOpencodePlugin() {
   try {
+    if (typeof ctx.syncOpencodePluginImpl === "function") return ctx.syncOpencodePluginImpl();
     const { registerOpencodePlugin } = require("../hooks/opencode-install.js");
     const { added, created } = registerOpencodePlugin({ silent: true });
     if (added || created) {
@@ -138,46 +183,61 @@ function truncateDeep(obj, depth) {
     ? obj.slice(0, PREVIEW_MAX) + "\u2026" : obj;
 }
 
+const HOOK_MARKER = "clawd-hook.js";
+const SETTINGS_FILENAME = "settings.json";
 // Watch ~/.claude/ directory for settings.json overwrites (e.g. CC-Switch)
 // that wipe our hooks. Re-register when hooks disappear.
 // Watch the directory (not the file) because atomic rename replaces the inode
 // and fs.watch on the old file silently stops firing on Windows.
-let settingsWatcher = null;
-const HOOK_MARKER = "clawd-hook.js";
-const SETTINGS_FILENAME = "settings.json";
-function watchSettingsForHookLoss() {
-  const settingsDir = path.join(os.homedir(), ".claude");
-  const settingsPath = path.join(settingsDir, SETTINGS_FILENAME);
-  let debounceTimer = null;
-  let lastSyncTime = 0;
+function stopClaudeSettingsWatcher() {
+  if (settingsWatchDebounceTimer) {
+    clearTimeoutFn(settingsWatchDebounceTimer);
+    settingsWatchDebounceTimer = null;
+  }
+  settingsWatchLastSyncTime = 0;
+  if (!settingsWatcher) return false;
   try {
-    settingsWatcher = fs.watch(settingsDir, (_event, filename) => {
+    settingsWatcher.close();
+  } catch {}
+  settingsWatcher = null;
+  return true;
+}
+
+function startClaudeSettingsWatcher() {
+  if (settingsWatcher) return false;
+  const settingsDir = getClaudeSettingsDir();
+  const settingsPath = getClaudeSettingsPath();
+  try {
+    settingsWatcher = fsApi.watch(settingsDir, (_event, filename) => {
       if (filename && filename !== SETTINGS_FILENAME) return;
-      if (debounceTimer) return;
-      debounceTimer = setTimeout(() => {
-        debounceTimer = null;
+      if (settingsWatchDebounceTimer) return;
+      settingsWatchDebounceTimer = setTimeoutFn(() => {
+        settingsWatchDebounceTimer = null;
         // Rate-limit: don't re-sync within 5s to avoid write wars with CC-Switch
-        if (Date.now() - lastSyncTime < 5000) return;
+        if (nowFn() - settingsWatchLastSyncTime < settingsWatchRateLimitMs) return;
         try {
-          const raw = fs.readFileSync(settingsPath, "utf-8");
+          const raw = fsApi.readFileSync(settingsPath, "utf-8");
           if (!raw.includes(HOOK_MARKER)) {
             console.log("Clawd: hooks wiped from settings.json — re-registering");
-            lastSyncTime = Date.now();
+            settingsWatchLastSyncTime = nowFn();
             syncClawdHooks();
           }
         } catch {}
-      }, 1000);
+      }, settingsWatchDebounceMs);
     });
-    settingsWatcher.on("error", (err) => {
+    if (settingsWatcher && typeof settingsWatcher.on === "function") settingsWatcher.on("error", (err) => {
       console.warn("Clawd: settings watcher error:", err.message);
     });
+    return true;
   } catch (err) {
     console.warn("Clawd: failed to watch settings directory:", err.message);
+    settingsWatcher = null;
+    return false;
   }
 }
 
 function startHttpServer() {
-  httpServer = http.createServer((req, res) => {
+  httpServer = createHttpServer((req, res) => {
     if (req.method === "GET" && req.url === "/state") {
       sendStateHealthResponse(res);
     } else if (req.method === "POST" && req.url === "/state") {
@@ -525,7 +585,7 @@ function startHttpServer() {
     }
   });
 
-  const listenPorts = getPortCandidates();
+  const listenPorts = getPortCandidatesFn();
   let listenIndex = 0;
   httpServer.on("error", (err) => {
     if (!activeServerPort && err.code === "EADDRINUSE" && listenIndex < listenPorts.length - 1) {
@@ -544,20 +604,22 @@ function startHttpServer() {
 
   httpServer.on("listening", () => {
     activeServerPort = listenPorts[listenIndex];
-    writeRuntimeConfig(activeServerPort);
+    writeRuntimeConfigFn(activeServerPort);
     console.log(`Clawd state server listening on 127.0.0.1:${activeServerPort}`);
     // Defer hook/plugin registration off the startup path. Each sync call
     // reads+parses+writes a config JSON (50-150ms cumulative on slow disks),
     // and all five operate on independent files for independent agents, so
     // none of them need to block the HTTP server from accepting traffic.
-    setImmediate(() => {
-      syncClawdHooks();
+    setImmediateFn(() => {
+      if (shouldManageClaudeHooks()) {
+        syncClawdHooks();
+        startClaudeSettingsWatcher();
+      }
       syncGeminiHooks();
       syncCursorHooks();
       syncCodeBuddyHooks();
       syncKiroHooks();
       syncOpencodePlugin();
-      watchSettingsForHookLoss();
     });
   });
 
@@ -565,12 +627,24 @@ function startHttpServer() {
 }
 
 function cleanup() {
-  clearRuntimeConfig();
-  if (settingsWatcher) settingsWatcher.close();
+  clearRuntimeConfigFn();
+  stopClaudeSettingsWatcher();
   if (httpServer) httpServer.close();
 }
 
-return { startHttpServer, getHookServerPort, syncClawdHooks, syncGeminiHooks, syncCursorHooks, syncCodeBuddyHooks, syncKiroHooks, syncOpencodePlugin, cleanup };
+return {
+  startHttpServer,
+  getHookServerPort,
+  syncClawdHooks,
+  syncGeminiHooks,
+  syncCursorHooks,
+  syncCodeBuddyHooks,
+  syncKiroHooks,
+  syncOpencodePlugin,
+  startClaudeSettingsWatcher,
+  stopClaudeSettingsWatcher,
+  cleanup,
+};
 
 };
 
