@@ -34,6 +34,9 @@ const VERSIONED_HOOKS = [
 ];
 
 const CLAUDE_VERSION_PATTERN = /(\d+\.\d+\.\d+)/;
+const CLAUDE_PACKAGE_JSON_SEGMENTS = ["node_modules", "@anthropic-ai", "claude-code", "package.json"];
+const CLAUDE_SHIM_CLI_PATTERN = /node_modules[\\/]+@anthropic-ai[\\/]+claude-code[\\/]+cli\.js/i;
+const MAX_CLAUDE_SHIM_BYTES = 64 * 1024;
 const UNKNOWN_CLAUDE_VERSION = Object.freeze({
   version: null,
   source: null,
@@ -51,6 +54,140 @@ function versionLessThan(a, b) {
     if ((pa[i] || 0) > (pb[i] || 0)) return false;
   }
   return false;
+}
+
+function parseClaudeVersion(value) {
+  if (typeof value !== "string") return null;
+  const match = value.match(CLAUDE_VERSION_PATTERN);
+  return match ? match[1] : null;
+}
+
+function getWindowsClaudePathSuffixes(pathExtEnv) {
+  const suffixes = [""];
+  const addSuffix = (value) => {
+    if (typeof value !== "string") return;
+    const trimmed = value.trim();
+    if (!trimmed) return;
+    const normalized = trimmed.startsWith(".") ? trimmed.toLowerCase() : `.${trimmed.toLowerCase()}`;
+    if (!suffixes.includes(normalized)) suffixes.push(normalized);
+  };
+
+  addSuffix(".cmd");
+  addSuffix(".ps1");
+
+  if (typeof pathExtEnv === "string") {
+    for (const entry of pathExtEnv.split(";")) {
+      addSuffix(entry);
+    }
+  }
+
+  return suffixes;
+}
+
+function getClaudePathCandidates(options = {}) {
+  const platform = options.platform || process.platform;
+  const pathEnv = options.pathEnv !== undefined ? options.pathEnv : process.env.PATH;
+  const existsSync = options.existsSync || fs.existsSync;
+
+  if (typeof pathEnv !== "string" || !pathEnv) return [];
+
+  const suffixes = platform === "win32"
+    ? getWindowsClaudePathSuffixes(options.pathExt !== undefined ? options.pathExt : process.env.PATHEXT)
+    : [""];
+  const delimiter = platform === "win32" ? ";" : ":";
+  const candidates = [];
+  const seen = new Set();
+
+  for (const rawDir of pathEnv.split(delimiter)) {
+    if (typeof rawDir !== "string") continue;
+    const dir = rawDir.trim().replace(/^"(.*)"$/, "$1");
+    if (!dir) continue;
+
+    for (const suffix of suffixes) {
+      const candidate = path.join(dir, `claude${suffix}`);
+      const key = platform === "win32" ? candidate.toLowerCase() : candidate;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      try {
+        if (existsSync(candidate)) candidates.push(candidate);
+      } catch {}
+    }
+  }
+
+  return candidates;
+}
+
+function getClaudePackageJsonCandidates(candidatePath, options = {}) {
+  const platform = options.platform || process.platform;
+  const existsSync = options.existsSync || fs.existsSync;
+  const readFileSync = options.readFileSync || fs.readFileSync;
+  const realpathSync = options.realpathSync || fs.realpathSync;
+  const statSync = options.statSync || fs.statSync;
+
+  if (!path.isAbsolute(candidatePath)) return [];
+
+  const candidates = [];
+  const seen = new Set();
+  const addCandidate = (packageJsonPath) => {
+    if (typeof packageJsonPath !== "string" || !packageJsonPath) return;
+    const key = platform === "win32" ? packageJsonPath.toLowerCase() : packageJsonPath;
+    if (seen.has(key)) return;
+    seen.add(key);
+
+    try {
+      if (existsSync(packageJsonPath)) candidates.push(packageJsonPath);
+    } catch {}
+  };
+
+  const candidateDir = path.dirname(candidatePath);
+  addCandidate(path.join(candidateDir, ...CLAUDE_PACKAGE_JSON_SEGMENTS));
+
+  try {
+    const resolvedPath = realpathSync(candidatePath);
+    addCandidate(path.join(path.dirname(resolvedPath), "package.json"));
+  } catch {}
+
+  try {
+    const stat = statSync(candidatePath);
+    const isRegularFile = typeof stat.isFile === "function" ? stat.isFile() : true;
+    // npm shims are tiny; skip unusually large files rather than reading arbitrary PATH entries into memory.
+    if (isRegularFile && typeof stat.size === "number" && stat.size <= MAX_CLAUDE_SHIM_BYTES) {
+      const shimSource = readFileSync(candidatePath, "utf8");
+      const shimMatch = shimSource.match(CLAUDE_SHIM_CLI_PATTERN);
+      if (shimMatch) {
+        const cliPath = path.resolve(candidateDir, shimMatch[0].replace(/[\\/]/g, path.sep));
+        addCandidate(path.join(path.dirname(cliPath), "package.json"));
+      }
+    }
+  } catch {}
+
+  return candidates;
+}
+
+function getClaudeVersionFromPackageJson(packageJsonPath, options = {}) {
+  const readFileSync = options.readFileSync || fs.readFileSync;
+
+  try {
+    const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8"));
+    const version = parseClaudeVersion(packageJson.version);
+    if (!version) return null;
+    return {
+      version,
+      source: packageJsonPath,
+      status: "known",
+    };
+  } catch {
+    return null;
+  }
+}
+
+function readClaudeVersionFallback(candidatePath, options = {}) {
+  for (const packageJsonPath of getClaudePackageJsonCandidates(candidatePath, options)) {
+    const versionInfo = getClaudeVersionFromPackageJson(packageJsonPath, options);
+    if (versionInfo) return versionInfo;
+  }
+  return null;
 }
 
 /**
@@ -72,28 +209,36 @@ function getClaudeVersion(options = {}) {
       "/usr/local/bin/claude"
     );
   }
+  candidates.push(...getClaudePathCandidates(options));
   candidates.push("claude");
 
   const seen = new Set();
+  let fallbackInfo = null;
   for (const candidate of candidates) {
-    if (seen.has(candidate)) continue;
-    seen.add(candidate);
+    const key = platform === "win32" ? candidate.toLowerCase() : candidate;
+    if (seen.has(key)) continue;
+    seen.add(key);
     try {
       const out = execFileSync(candidate, ["--version"], {
         encoding: "utf8",
         timeout: 5000,
         windowsHide: true,
       });
-      const match = out.match(CLAUDE_VERSION_PATTERN);
-      if (!match) continue;
+      const version = parseClaudeVersion(out);
+      if (!version) continue;
       return {
-        version: match[1],
+        version,
         source: candidate === "claude" ? "PATH:claude" : candidate,
         status: "known",
       };
     } catch {}
+
+    const fallback = readClaudeVersionFallback(candidate, options);
+    // Prefer a candidate that can answer `--version` directly; keep the first metadata
+    // fallback in search order, but continue scanning in case a later executable works.
+    if (fallback && !fallbackInfo) fallbackInfo = fallback;
   }
-  return { ...UNKNOWN_CLAUDE_VERSION };
+  return fallbackInfo || { ...UNKNOWN_CLAUDE_VERSION };
 }
 
 const MARKER = "clawd-hook.js";
@@ -710,6 +855,12 @@ module.exports = {
   unregisterAutoStart,
   isAutoStartRegistered,
   __test: {
+    parseClaudeVersion,
+    getWindowsClaudePathSuffixes,
+    getClaudePathCandidates,
+    getClaudePackageJsonCandidates,
+    getClaudeVersionFromPackageJson,
+    readClaudeVersionFallback,
     getClaudeVersion,
     isClawdPermissionHook,
     isClawdPermissionUrl,
