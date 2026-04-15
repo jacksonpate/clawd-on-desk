@@ -497,6 +497,28 @@ function startHttpServer() {
           }
         }
       });
+    } else if (req.method === "POST" && req.url === "/response") {
+      let body = "", bodySize = 0, tooLarge = false;
+      req.on("data", (chunk) => {
+        bodySize += chunk.length;
+        if (bodySize > 32768) { tooLarge = true; return; }
+        body += chunk;
+      });
+      req.on("end", () => {
+        if (tooLarge) { res.writeHead(413); res.end(); return; }
+        try {
+          const { response_text } = JSON.parse(body);
+          if (typeof response_text === "string" && response_text.trim() &&
+              typeof ctx.showResponse === "function") {
+            ctx.showResponse(response_text.trim());
+          }
+          res.writeHead(200, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
+          res.end("ok");
+        } catch {
+          res.writeHead(400);
+          res.end("bad json");
+        }
+      });
     } else {
       res.writeHead(404);
       res.end();

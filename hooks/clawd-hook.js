@@ -3,7 +3,7 @@
 // Usage: node clawd-hook.js <event_name>
 // Reads stdin JSON from Claude Code for session_id
 
-const { postStateToRunningServer, readHostPrefix } = require("./server-config");
+const { postStateToRunningServer, postToRunningServer, readHostPrefix } = require("./server-config");
 const { createPidResolver, readStdinJson, getPlatformConfig } = require("./shared-process");
 
 const EVENT_TO_STATE = {
@@ -77,9 +77,48 @@ readStdinJson().then((payload) => {
     if (pidChain.length) body.pid_chain = pidChain;
   }
 
+  // Track pending async posts; only exit when all are done
+  let pendingPosts = 1; // always at least the state POST
+  const maybeExit = () => { if (--pendingPosts <= 0) process.exit(0); };
+
+  // On Stop: extract last assistant message from transcript and send to response bubble
+  if (event === "Stop" && payload.transcript_path) {
+    pendingPosts++; // hold the process open while we wait + read
+    // Small delay so Claude Code finishes flushing the final entry before we read
+    setTimeout(() => {
+      const fs = require("fs");
+      try {
+        const raw = fs.readFileSync(payload.transcript_path, "utf8");
+        const lines = raw.trim().split("\n");
+        for (let i = lines.length - 1; i >= 0; i--) {
+          try {
+            const entry = JSON.parse(lines[i]);
+            if (entry.type === "assistant" && entry.message) {
+              const content = entry.message.content;
+              const parts = Array.isArray(content)
+                ? content.filter(c => c.type === "text").map(c => c.text)
+                : (typeof content === "string" ? [content] : []);
+              const text = parts.join("\n").trim();
+              if (text) {
+                postToRunningServer(
+                  "/response",
+                  JSON.stringify({ response_text: text.slice(0, 3000), session_id: sessionId }),
+                  { timeoutMs: 500 },
+                  maybeExit
+                );
+                return; // maybeExit will be called by postToRunningServer callback
+              }
+            }
+          } catch {}
+        }
+      } catch {}
+      maybeExit(); // nothing found or error — still need to decrement
+    }, 250);
+  }
+
   postStateToRunningServer(
     JSON.stringify(body),
     { timeoutMs: 100 },
-    () => process.exit(0)
+    maybeExit
   );
 });

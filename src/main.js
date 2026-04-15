@@ -614,13 +614,41 @@ const _tickCtx = {
   miniPeekOut: () => miniPeekOut(),
   getObjRect,
   getHitRectScreen,
+  syncHitWin,
+  moveWindowTo(x, y) {
+    if (!win || win.isDestroyed()) return;
+    const size = getCurrentPixelSize();
+    win.setBounds({ x, y, width: size.width, height: size.height });
+    syncHitWin();
+  },
 };
 const _tick = require("./tick")(_tickCtx);
 const { startMainTick, resetIdleTimer } = _tick;
 
+// ── Follower — cursor-following + boredom wander ──
+const _follower = require("./follower")(_tickCtx);
+
 // ── Terminal focus — delegated to src/focus.js ──
 const _focus = require("./focus")({ _allowSetForeground });
 const { initFocusHelper, killFocusHelper, focusTerminalWindow, clearMacFocusCooldownTimer } = _focus;
+
+// ── Chat bubble ──
+const _chatCtx = {
+  get win() { return win; },
+  get sessions() { return sessions; },
+  getNearestWorkArea: (x, y) => getNearestWorkArea(x, y),
+  focusTerminalWindow: (...args) => focusTerminalWindow(...args),
+  freezeFollower:  () => _follower.freeze(),
+  unfreezeFollower: () => _follower.unfreeze(),
+  isFollowerFrozen: () => _follower.isFrozen(),
+};
+const _chat = require("./chat")(_chatCtx);
+
+// ── Response bubble ──
+const _response = require("./response")({
+  get win() { return win; },
+  getNearestWorkArea: (x, y) => getNearestWorkArea(x, y),
+});
 
 // ── HTTP server — delegated to src/server.js ──
 const _serverCtx = {
@@ -640,6 +668,7 @@ const _serverCtx = {
   showPermissionBubble,
   replyOpencodePermission,
   permLog,
+  showResponse: (text) => _response.show(text),
 };
 const _server = require("./server")(_serverCtx);
 const { startHttpServer, getHookServerPort } = _server;
@@ -1238,7 +1267,9 @@ function createWindow() {
     });
   }
 
-  ipcMain.on("show-context-menu", showPetContextMenu);
+  ipcMain.on("show-context-menu", () => _chat.show());
+  _chat.registerIpc();
+  _response.registerIpc();
 
   ipcMain.on("move-window-by", (event, dx, dy) => {
     if (_mini.getMiniMode() || _mini.getMiniTransitioning()) return;
@@ -1286,6 +1317,8 @@ function createWindow() {
         repositionUpdateBubble();
       }
     }
+    // Sync follower float position so it doesn't snap back to pre-drag location
+    _follower.syncPosition();
   });
 
   ipcMain.on("exit-mini-mode", () => {
@@ -1318,6 +1351,7 @@ function createWindow() {
 
   initFocusHelper();
   startMainTick();
+  _follower.start();
   startHttpServer();
   startStaleCleanup();
   // Wait for renderer to be ready before sending initial state
@@ -1463,6 +1497,9 @@ function activateTheme(themeId) {
 
   _state.cleanup();
   _tick.cleanup();
+  _follower.stop();
+  _chat.cleanup();
+  _response.cleanup();
   _mini.cleanup();
   // ⚠️ Don't clear pendingPermissions — bubbles are independent BrowserWindows
   // ⚠️ Don't clear sessions — keep active session tracking

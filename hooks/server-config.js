@@ -161,13 +161,14 @@ function probePort(port, timeoutMs, callback, options = {}) {
   });
 }
 
-function postStateToPort(port, payload, timeoutMs, callback, options = {}) {
+function postToPort(port, payload, timeoutMs, callback, options = {}) {
   const httpRequest = options.httpRequest || http.request;
+  const routePath = (options && options.path) || STATE_PATH;
   const req = httpRequest(
     {
       hostname: "127.0.0.1",
       port,
-      path: STATE_PATH,
+      path: routePath,
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -224,12 +225,16 @@ function discoverClawdPort(options, callback) {
   tryNext();
 }
 
+// Backward-compat alias — postStateToPort always used STATE_PATH
+const postStateToPort = (port, payload, timeoutMs, callback, options = {}) =>
+  postToPort(port, payload, timeoutMs, callback, { ...options, path: STATE_PATH });
+
 function postStateToRunningServer(body, options, callback) {
   const timeoutMs = options && options.timeoutMs ? options.timeoutMs : 100;
   const payload = typeof body === "string" ? body : JSON.stringify(body);
   const { direct, fallback } = splitPortCandidates(options && options.preferredPort, options);
   const probe = options && options.probePort ? options.probePort : probePort;
-  const post = options && options.postStateToPort ? options.postStateToPort : postStateToPort;
+  const post = options && options.postStateToPort ? options.postStateToPort : postToPort;
   let directIndex = 0;
   let fallbackIndex = 0;
 
@@ -272,6 +277,15 @@ function postStateToRunningServer(body, options, callback) {
   };
 
   tryDirect();
+}
+
+/**
+ * Like postStateToRunningServer but posts to an arbitrary path (e.g. /response).
+ * options.path sets the route; falls back to STATE_PATH if omitted.
+ */
+function postToRunningServer(routePath, body, options, callback) {
+  const opts = Object.assign({}, options, { path: routePath || STATE_PATH });
+  postStateToRunningServer(body, opts, callback || (() => {}));
 }
 
 /**
@@ -363,11 +377,13 @@ module.exports = {
   discoverClawdPort,
   getPortCandidates,
   postStateToRunningServer,
+  postToRunningServer,
   probePort,
   readHostPrefix,
   readRuntimePort,
   resolveNodeBin,
   splitPortCandidates,
   postStateToPort,
+  postToPort,
   writeRuntimeConfig,
 };
