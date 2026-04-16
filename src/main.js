@@ -2408,6 +2408,7 @@ function createWindow() {
     pinnedSessionIds.add(next.id);
     pinnedSessionCwds[next.id] = { cwd: next.cwd || "", editor: next.editor || null, sourcePid: next.sourcePid || 0 };
     _savePinnedSessions();
+    if (typeof _state.cancelOneShotAnimation === "function") _state.cancelOneShotAnimation();
     _resolvePinnedState();
 
     // Flash session name on Clawd via renderer

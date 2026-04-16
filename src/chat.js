@@ -261,6 +261,20 @@ public class WinSend {
     System.Threading.Thread.Sleep(20);
     PostMessage(target, 0x0202, (IntPtr)0, lp); // WM_LBUTTONUP
   }
+
+  // Click ~10px from the right edge of the MAIN window, vertically centered — no cursor movement.
+  // Uses the main window rect for coordinates so the position is always near the true right border.
+  public static void ClickWindowNearRight(IntPtr h) {
+    if (h == IntPtr.Zero) return;
+    RECT r = new RECT();
+    if (!GetClientRect(h, ref r)) return;
+    int cx = r.Left + (int)((r.Right - r.Left) * 0.93);
+    int cy = (r.Top + r.Bottom) / 2;
+    IntPtr lp = (IntPtr)(((cy & 0xFFFF) << 16) | (cx & 0xFFFF));
+    PostMessage(h, 0x0201, (IntPtr)1, lp); // WM_LBUTTONDOWN
+    System.Threading.Thread.Sleep(20);
+    PostMessage(h, 0x0202, (IntPtr)0, lp); // WM_LBUTTONUP
+  }
 }
 "@
 Add-Type -AssemblyName System.Windows.Forms
@@ -321,25 +335,35 @@ if ($target -eq [IntPtr]::Zero) {
 Add-Content $dbg "[$(Get-Date -f o)] $($log -join ' | ') => $target"
 
 [System.Windows.Forms.Clipboard]::SetText($text)
+$wasMinimized = $false
 if ($target -ne [IntPtr]::Zero) {
+  # Flash mode: if PSH or Obsidian was minimized, remember so we can re-minimize after paste
+  if (($editor -eq "cmd" -or $editor -eq "obsidian") -and [WinSend]::IsIconic($target)) {
+    $wasMinimized = $true
+  }
   [WinSend]::FocusWindow($target)
   # For Electron/Chrome apps, also move focus into the render widget (terminal pane)
   if ($editor -eq "antigravity" -or $editor -eq "obsidian") {
     Start-Sleep -Milliseconds 150
     [WinSend]::FocusRenderWidget($target)
   }
-  # Click near the bottom of the window — only for Claude Desktop
-  if ($editor -eq "claude") { [WinSend]::ClickWindow($target) }
+  # Obsidian: ghost-click 10px from right edge to ensure terminal pane is active
+  if ($editor -eq "obsidian") {
+    Start-Sleep -Milliseconds 100
+    [WinSend]::ClickWindowNearRight($target)
+  }
   Start-Sleep -Milliseconds 675
 }
-# Paste using the correct shortcut for each app type:
-#   Obsidian terminal plugin: Ctrl+Shift+V  (xterm.js default)
-#   PowerShell console:       Shift+Insert  (universal Windows console paste)
-#   Everything else:          Ctrl+V
+# Paste using the correct shortcut for each app type
 if ($editor -eq "cmd") {
   [System.Windows.Forms.SendKeys]::SendWait("^+v{ENTER}")
 } else {
   [System.Windows.Forms.SendKeys]::SendWait("^v{ENTER}")
+}
+# Flash: re-minimize if it was minimized before we restored it
+if ($wasMinimized) {
+  if ($editor -eq "obsidian") { Start-Sleep -Milliseconds 1000 } else { Start-Sleep -Milliseconds 300 }
+  [WinSend]::ShowWindow($target, 6)
 }
 `;
     // Grant PS process permission to steal foreground focus

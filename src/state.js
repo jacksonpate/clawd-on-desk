@@ -72,6 +72,7 @@ let pendingTimer = null;
 let autoReturnTimer = null;
 let pendingState = null;
 let eyeResendTimer = null;
+let lastNotificationAt = 0; // throttle repeated notification/attention spam
 let updateVisualState = null;
 let updateVisualSvgOverride = null;
 
@@ -381,7 +382,11 @@ function updateSession(sessionId, state, event, sourcePid, cwd, editor, pidChain
   }
 
   if (event === "PermissionRequest") {
-    setState("notification");
+    const now = Date.now();
+    if (now - lastNotificationAt > 5000) {
+      lastNotificationAt = now;
+      setState("notification");
+    }
     return;
   }
 
@@ -502,7 +507,11 @@ function updateSession(sessionId, state, event, sourcePid, cwd, editor, pidChain
   cleanStaleSessions();
 
   if (ONESHOT_STATES.has(state)) {
-    setState(state);
+    const now = Date.now();
+    if (now - lastNotificationAt > 5000) {
+      lastNotificationAt = now;
+      setState(state);
+    }
     return;
   }
 
@@ -868,8 +877,16 @@ function cleanup() {
   stopStaleCleanup();
 }
 
+function cancelOneShotAnimation() {
+  if (autoReturnTimer) { clearTimeout(autoReturnTimer); autoReturnTimer = null; }
+  if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
+  lastNotificationAt = 0; // allow next pin's animation to fire immediately
+  applyState("idle");
+}
+
 return {
   setState, applyState, updateSession, resolveDisplayState, setUpdateVisualState,
+  cancelOneShotAnimation,
   enableDoNotDisturb, disableDoNotDisturb,
   startStaleCleanup, stopStaleCleanup, startWakePoll, stopWakePoll,
   getSvgOverride, cleanStaleSessions, startStartupRecovery, refreshTheme,
