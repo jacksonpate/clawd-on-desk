@@ -152,6 +152,7 @@ public class WinSend {
   [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll")] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
@@ -276,14 +277,29 @@ public class WinSend {
     PostMessage(h, 0x0202, (IntPtr)0, lp); // WM_LBUTTONUP
   }
 
-  // Click at 93% down the main window, horizontally centered — no cursor movement.
+  // Click at 92% (maximized) or 88% (windowed) down the main window, horizontally centered — no cursor movement.
   // Used for Claude Desktop to land in the chat input area.
   public static void ClickWindowBottom(IntPtr h) {
     if (h == IntPtr.Zero) return;
     RECT r = new RECT();
     if (!GetClientRect(h, ref r)) return;
+    double pct = IsZoomed(h) ? 0.92 : 0.88;
     int cx = (r.Left + r.Right) / 2;
-    int cy = r.Top + (int)((r.Bottom - r.Top) * 0.93);
+    int cy = r.Top + (int)((r.Bottom - r.Top) * pct);
+    IntPtr lp = (IntPtr)(((cy & 0xFFFF) << 16) | (cx & 0xFFFF));
+    PostMessage(h, 0x0201, (IntPtr)1, lp); // WM_LBUTTONDOWN
+    System.Threading.Thread.Sleep(20);
+    PostMessage(h, 0x0202, (IntPtr)0, lp); // WM_LBUTTONUP
+  }
+
+  // Click at 89% down the main window, horizontally centered — no cursor movement.
+  // Used for Antigravity to land in the terminal pane.
+  public static void ClickWindowBottom85(IntPtr h) {
+    if (h == IntPtr.Zero) return;
+    RECT r = new RECT();
+    if (!GetClientRect(h, ref r)) return;
+    int cx = (r.Left + r.Right) / 2;
+    int cy = r.Top + (int)((r.Bottom - r.Top) * 0.89);
     IntPtr lp = (IntPtr)(((cy & 0xFFFF) << 16) | (cx & 0xFFFF));
     PostMessage(h, 0x0201, (IntPtr)1, lp); // WM_LBUTTONDOWN
     System.Threading.Thread.Sleep(20);
@@ -360,6 +376,11 @@ if ($target -ne [IntPtr]::Zero) {
   if ($editor -eq "antigravity" -or $editor -eq "obsidian") {
     Start-Sleep -Milliseconds 150
     [WinSend]::FocusRenderWidget($target)
+  }
+  # Antigravity: ghost-click at 85% down to land focus in terminal pane
+  if ($editor -eq "antigravity") {
+    Start-Sleep -Milliseconds 100
+    [WinSend]::ClickWindowBottom85($target)
   }
   # Obsidian: ghost-click at 93% right to ensure terminal pane is active
   if ($editor -eq "obsidian") {
