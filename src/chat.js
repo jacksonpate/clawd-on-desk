@@ -275,6 +275,20 @@ public class WinSend {
     System.Threading.Thread.Sleep(20);
     PostMessage(h, 0x0202, (IntPtr)0, lp); // WM_LBUTTONUP
   }
+
+  // Click at 93% down the main window, horizontally centered — no cursor movement.
+  // Used for Claude Desktop to land in the chat input area.
+  public static void ClickWindowBottom(IntPtr h) {
+    if (h == IntPtr.Zero) return;
+    RECT r = new RECT();
+    if (!GetClientRect(h, ref r)) return;
+    int cx = (r.Left + r.Right) / 2;
+    int cy = r.Top + (int)((r.Bottom - r.Top) * 0.93);
+    IntPtr lp = (IntPtr)(((cy & 0xFFFF) << 16) | (cx & 0xFFFF));
+    PostMessage(h, 0x0201, (IntPtr)1, lp); // WM_LBUTTONDOWN
+    System.Threading.Thread.Sleep(20);
+    PostMessage(h, 0x0202, (IntPtr)0, lp); // WM_LBUTTONUP
+  }
 }
 "@
 Add-Type -AssemblyName System.Windows.Forms
@@ -347,10 +361,15 @@ if ($target -ne [IntPtr]::Zero) {
     Start-Sleep -Milliseconds 150
     [WinSend]::FocusRenderWidget($target)
   }
-  # Obsidian: ghost-click 10px from right edge to ensure terminal pane is active
+  # Obsidian: ghost-click at 93% right to ensure terminal pane is active
   if ($editor -eq "obsidian") {
     Start-Sleep -Milliseconds 100
     [WinSend]::ClickWindowNearRight($target)
+  }
+  # Claude Desktop: ghost-click at 93% down (chat input area)
+  if ($editor -eq "claude") {
+    Start-Sleep -Milliseconds 100
+    [WinSend]::ClickWindowBottom($target)
   }
   Start-Sleep -Milliseconds 275
 }
