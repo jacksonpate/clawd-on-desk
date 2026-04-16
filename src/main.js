@@ -688,11 +688,18 @@ const _chatCtx = {
   get sessions() { return sessions; },
   get pinnedSessionIds() { return pinnedSessionIds; },
   get pinnedSessionCwds() { return pinnedSessionCwds; },
+  get selectedSessionIds() { return selectedSessionIds; },
   getNearestWorkArea: (x, y) => getNearestWorkArea(x, y),
   focusTerminalWindow: (...args) => focusTerminalWindow(...args),
   freezeFollower:  () => _follower.freeze(),
   unfreezeFollower: () => _follower.unfreeze(),
   isFollowerFrozen: () => _follower.isFrozen(),
+  // Allow any process to steal foreground focus (called before spawning PS script)
+  allowAnyForeground: () => {
+    if (_allowSetForeground) {
+      try { _allowSetForeground(-1); } catch {}
+    }
+  },
 };
 const _chat = require("./chat")(_chatCtx);
 
@@ -702,26 +709,65 @@ const _response = require("./response")({
   getNearestWorkArea: (x, y) => getNearestWorkArea(x, y),
 });
 
+// ── Session picker bubble (Shift+Right-click) ──
+const _sessionPicker = require("./session-picker")({
+  get win() { return win; },
+  getNearestWorkArea: (x, y) => getNearestWorkArea(x, y),
+  get sessions() { return sessions; },
+  get selectedSessionIds() { return selectedSessionIds; },
+  get pinnedSessionIds() { return pinnedSessionIds; },
+  get pinnedSessionCwds() { return pinnedSessionCwds; },
+  get sessionNames() { return sessionNames; },
+  get selectedSessionMeta() { return selectedSessionMeta; },
+  saveSelectedSessions: () => _saveSelectedSessions(),
+  saveSelectedMeta: () => _saveSelectedMeta(),
+  savePinnedSessions: () => _savePinnedSessions(),
+  renameSession: (id, name) => {
+    if (!id) return;
+    if (name && name.trim()) sessionNames[id] = name.trim();
+    else delete sessionNames[id];
+    _saveSessionNames();
+  },
+});
+
 // ── Pinned sessions — persisted across restarts via separate JSON file ──
 // Empty = respond to all sessions. Non-empty = whitelist.
-// Format: [{ id, cwd }] — cwd saved so chat routing works right after restart
+// Format: [{ id, cwd, editor, sourcePid }] — metadata saved so chat routing works right after restart
 const PINNED_SESSIONS_PATH = path.join(app.getPath("userData"), "clawd-pinned-sessions.json");
 function _loadPinnedSessions() {
   try {
     const raw = JSON.parse(require("fs").readFileSync(PINNED_SESSIONS_PATH, "utf8"));
-    // Support both old format (array of strings) and new format (array of {id,cwd})
+    // Support old format (array of strings or {id,cwd}) and new format ({id,cwd,editor,sourcePid})
     if (!Array.isArray(raw)) return { ids: [], cwds: {} };
     const ids = [], cwds = {};
     for (const entry of raw) {
       if (typeof entry === "string") { ids.push(entry); }
-      else if (entry && typeof entry.id === "string") { ids.push(entry.id); if (entry.cwd) cwds[entry.id] = entry.cwd; }
+      else if (entry && typeof entry.id === "string") {
+        // pinned:false = selected-only session saved just for editor metadata, NOT a real pin
+        if (entry.pinned !== false) ids.push(entry.id);
+        cwds[entry.id] = { cwd: entry.cwd || "", editor: entry.editor || null, sourcePid: entry.sourcePid || 0 };
+      }
     }
     return { ids, cwds };
   } catch { return { ids: [], cwds: {} }; }
 }
 function _savePinnedSessions() {
   try {
-    const arr = [...pinnedSessionIds].map(id => ({ id, cwd: pinnedSessionCwds[id] || null }));
+    // Save pinned sessions first, then any selected-only sessions that have editor metadata.
+    // This way editor assignments survive restarts even for sessions that aren't "pinned".
+    const arr = [];
+    for (const id of pinnedSessionIds) {
+      const meta = pinnedSessionCwds[id] || {};
+      const sel  = selectedSessionMeta[id] || {};
+      arr.push({ id, cwd: meta.cwd || sel.cwd || null, editor: meta.editor || sel.editor || null, sourcePid: meta.sourcePid || sel.sourcePid || 0, pinned: true });
+    }
+    for (const id of selectedSessionIds) {
+      if (pinnedSessionIds.has(id)) continue; // already included above
+      const meta = pinnedSessionCwds[id] || selectedSessionMeta[id] || {};
+      if (meta.editor || meta.cwd) {
+        arr.push({ id, cwd: meta.cwd || null, editor: meta.editor || null, sourcePid: meta.sourcePid || 0, pinned: false });
+      }
+    }
     require("fs").writeFileSync(PINNED_SESSIONS_PATH, JSON.stringify(arr));
   } catch (err) {
     console.error("Clawd: failed to save pinned sessions:", err && err.message);
@@ -730,6 +776,42 @@ function _savePinnedSessions() {
 const { ids: _loadedPinnedIds, cwds: _loadedPinnedCwds } = _loadPinnedSessions();
 const pinnedSessionIds = new Set(_loadedPinnedIds);
 const pinnedSessionCwds = { ..._loadedPinnedCwds }; // id -> cwd, updated when sessions register
+
+// ── Session custom names — persisted display labels (id → string) ──
+const SESSION_NAMES_PATH = path.join(app.getPath("userData"), "clawd-session-names.json");
+function _loadSessionNames() {
+  try {
+    const raw = JSON.parse(require("fs").readFileSync(SESSION_NAMES_PATH, "utf8"));
+    return (raw && typeof raw === "object") ? raw : {};
+  } catch { return {}; }
+}
+function _saveSessionNames() {
+  try { require("fs").writeFileSync(SESSION_NAMES_PATH, JSON.stringify(sessionNames)); } catch {}
+}
+const sessionNames = _loadSessionNames();
+
+// ── Selected sessions — the cycling pool for Ctrl+Right-click ──
+// Separate from pinnedSessionIds. User picks which sessions to include in the
+// cycle; Ctrl+Right-click steps through them and pins whichever you land on.
+const SELECTED_SESSIONS_PATH = path.join(app.getPath("userData"), "clawd-selected-sessions.json");
+const SELECTED_META_PATH = path.join(app.getPath("userData"), "clawd-selected-meta.json");
+function _loadSelectedSessions() {
+  try {
+    const raw = JSON.parse(require("fs").readFileSync(SELECTED_SESSIONS_PATH, "utf8"));
+    return Array.isArray(raw) ? raw.filter(s => typeof s === "string") : [];
+  } catch { return []; }
+}
+function _saveSelectedSessions() {
+  try { require("fs").writeFileSync(SELECTED_SESSIONS_PATH, JSON.stringify([...selectedSessionIds])); } catch {}
+}
+function _loadSelectedMeta() {
+  try { return JSON.parse(require("fs").readFileSync(SELECTED_META_PATH, "utf8")) || {}; } catch { return {}; }
+}
+function _saveSelectedMeta() {
+  try { require("fs").writeFileSync(SELECTED_META_PATH, JSON.stringify(selectedSessionMeta)); } catch {}
+}
+const selectedSessionIds = new Set(_loadSelectedSessions());
+const selectedSessionMeta = _loadSelectedMeta(); // id → { cwd, editor }
 
 // ── HTTP server — delegated to src/server.js ──
 const _serverCtx = {
@@ -745,13 +827,70 @@ const _serverCtx = {
   isAgentPermissionsEnabled: (agentId) => _isAgentPermissionsEnabled({ agents: _settingsController.get("agents") }, agentId),
   setState,
   updateSession: (sid, ...args) => {
-    // Keep pinnedSessionCwds fresh — cwd is args[2] (3rd positional after sid, state, event, sourcePid, cwd)
-    const cwd = args[3]; // updateSession(sid, state, event, sourcePid, cwd, ...)
-    if (cwd && pinnedSessionIds.has(sid) && pinnedSessionCwds[sid] !== cwd) {
-      pinnedSessionCwds[sid] = cwd;
-      _savePinnedSessions();
+    // Keep pinnedSessionCwds fresh — cwd is args[3] (updateSession(sid, state, event, sourcePid, cwd, ...))
+    const cwd = args[3];
+    if (cwd && pinnedSessionIds.has(sid)) {
+      const existing = pinnedSessionCwds[sid] || {};
+      if (existing.cwd !== cwd) {
+        pinnedSessionCwds[sid] = { ...existing, cwd };
+        _savePinnedSessions();
+      }
     }
     return updateSession(sid, ...args);
+  },
+  // Silent Map update — registers a session for UI visibility WITHOUT changing Clawd's visual state.
+  // Called before the pin filter so ALL sessions always appear in the Sessions tab.
+  touchSession: (sid, state, sourcePid, cwd, editor, agentId, agentPid, pidChain) => {
+    if (!sid) return;
+    // If a real hook session arrives for a PID that was previously only
+    // tracked as a synthetic proc-{pid} entry, remove the synthetic one.
+    if (sourcePid > 0) {
+      const synthId = `proc-${sourcePid}`;
+      if (sessions.has(synthId) && synthId !== sid) sessions.delete(synthId);
+    }
+    const existing = sessions.get(sid);
+    const now = Date.now();
+    // If hook sent us a PID, the process is alive — trust it
+    const pidAlive = sourcePid > 0;
+    if (existing) {
+      existing.updatedAt = now;
+      if (sourcePid) { existing.sourcePid = sourcePid; existing.pidReachable = true; }
+      if (agentPid) existing.agentPid = agentPid;
+      if (pidChain && pidChain.length) existing.pidChain = pidChain;
+      if (cwd) existing.cwd = cwd;
+      if (editor) existing.editor = editor;
+      if (agentId) existing.agentId = agentId;
+      if (state && state !== "sleeping") existing.state = state;
+    } else {
+      sessions.set(sid, {
+        state: state || "idle",
+        updatedAt: now,
+        sourcePid: sourcePid || null,
+        cwd: cwd || "",
+        editor: editor || null,
+        pidChain: null,
+        agentPid: null,
+        agentId: agentId || "claude-code",
+        host: null,
+        headless: false,
+        pidReachable: pidAlive,
+        preseeded: !pidAlive, // no PID = keep alive via preseeded flag
+        displayHint: null,
+        resumeState: null,
+      });
+    }
+    // Keep pinnedSessionCwds fresh with routing metadata (editor + sourcePid)
+    // so chat routing works correctly after a Clawd restart without waiting for the next hook.
+    if (pinnedSessionIds.has(sid) && (editor || sourcePid || cwd)) {
+      const existingMeta = pinnedSessionCwds[sid] || {};
+      const updated = {
+        cwd: cwd || existingMeta.cwd || "",
+        editor: editor || existingMeta.editor || null,
+        sourcePid: sourcePid || existingMeta.sourcePid || 0,
+      };
+      const changed = updated.cwd !== existingMeta.cwd || updated.editor !== existingMeta.editor || updated.sourcePid !== existingMeta.sourcePid;
+      if (changed) { pinnedSessionCwds[sid] = updated; _savePinnedSessions(); }
+    }
   },
   resolvePermissionEntry,
   sendPermissionResponse,
@@ -759,12 +898,18 @@ const _serverCtx = {
   replyOpencodePermission,
   permLog,
   showResponse: (text) => _response.show(text),
-  isSessionAllowed: (sessionId) => {
-    const allowed = pinnedSessionIds.size === 0 || pinnedSessionIds.has(sessionId);
-    if (pinnedSessionIds.size > 0) {
-      try { require("fs").appendFileSync(require("path").join(app.getPath("userData"), "clawd-session-filter.log"), `[${new Date().toISOString()}] incoming=${sessionId} pinned=[${[...pinnedSessionIds].join(",")}] allowed=${allowed}\n`); } catch {}
-    }
-    return allowed;
+  isSessionAllowed: (sessionId, event) => {
+    // Always let SessionStart through so every session registers in the Map
+    // (makes them visible in the UI / available to pin). State changes from
+    // non-pinned sessions are still filtered by the caller returning 204.
+    if (event === "SessionStart" || event === "SessionEnd") return true;
+    if (pinnedSessionIds.size === 0) return true;
+    if (pinnedSessionIds.has(sessionId)) return true;
+    // If ALL pinned IDs are stale (not present in live sessions Map), treat as
+    // no pins — avoids blackout after Clawd restart when session IDs change.
+    const hasLivePin = [...pinnedSessionIds].some(id => sessions.has(id));
+    if (!hasLivePin) return true;
+    return false;
   },
 };
 const _server = require("./server")(_serverCtx);
@@ -1452,6 +1597,7 @@ ipcMain.handle("settings:list-sessions", () => {
       headless: !!s.headless,
       agentId: s.agentId || null,
       pinned: pinnedSessionIds.has(id),
+      selected: selectedSessionIds.has(id),
       offline: false,
     });
   }
@@ -1461,12 +1607,13 @@ ipcMain.handle("settings:list-sessions", () => {
       result.push({
         id,
         state: "offline",
-        cwd: pinnedSessionCwds[id] || null,
+        cwd: (pinnedSessionCwds[id] && pinnedSessionCwds[id].cwd) || null,
         updatedAt: 0,
         host: null,
         headless: false,
         agentId: null,
         pinned: true,
+        selected: selectedSessionIds.has(id),
         offline: true,
       });
     }
@@ -1477,7 +1624,7 @@ ipcMain.handle("settings:list-sessions", () => {
     if (b.pinned && !b.offline && (!a.pinned || a.offline)) return 1;
     return b.updatedAt - a.updatedAt;
   });
-  return { sessions: result, pinnedSessionIds: [...pinnedSessionIds] };
+  return { sessions: result, pinnedSessionIds: [...pinnedSessionIds], selectedSessionIds: [...selectedSessionIds] };
 });
 
 function _resolvePinnedState() {
@@ -1505,7 +1652,7 @@ ipcMain.handle("settings:pin-session", (_event, id) => {
     Object.keys(pinnedSessionCwds).forEach(k => delete pinnedSessionCwds[k]);
     pinnedSessionIds.add(id);
     const live = sessions.get(id);
-    if (live && live.cwd) pinnedSessionCwds[id] = live.cwd;
+    if (live) pinnedSessionCwds[id] = { cwd: live.cwd || "", editor: live.editor || null, sourcePid: live.sourcePid || 0 };
   }
   _savePinnedSessions();
   _resolvePinnedState();
@@ -1516,6 +1663,49 @@ ipcMain.handle("settings:clear-pinned-sessions", () => {
   pinnedSessionIds.clear();
   _savePinnedSessions();
   return { pinnedSessionIds: [] };
+});
+
+ipcMain.handle("settings:toggle-selected-session", (_event, id) => {
+  if (!id) return { selectedSessionIds: [...selectedSessionIds] };
+  if (selectedSessionIds.has(id)) {
+    selectedSessionIds.delete(id);
+    delete selectedSessionMeta[id];
+    _saveSelectedMeta();
+    // If this was also pinned, unpin it
+    if (pinnedSessionIds.has(id)) {
+      pinnedSessionIds.delete(id);
+      delete pinnedSessionCwds[id];
+      _savePinnedSessions();
+      _resolvePinnedState();
+    }
+  } else {
+    selectedSessionIds.add(id);
+    // Capture metadata so this session stays visible even if .jsonl moves/disappears
+    const live = sessions.get(id);
+    if (live) {
+      selectedSessionMeta[id] = { cwd: live.cwd || "", editor: live.editor || null };
+      _saveSelectedMeta();
+    }
+  }
+  _saveSelectedSessions();
+  return { selectedSessionIds: [...selectedSessionIds] };
+});
+
+ipcMain.handle("settings:clear-stale-sessions", () => {
+  // Remove all sessions that are preseeded-only (no live PID, no recent hook activity).
+  // Live sessions (pidReachable=true or updated within last 2 minutes) are kept.
+  const cutoff = Date.now() - 2 * 60 * 1000;
+  for (const [id, s] of sessions) {
+    if (!s.pidReachable && (s.updatedAt || 0) < cutoff) {
+      sessions.delete(id);
+      if (pinnedSessionIds.has(id)) {
+        pinnedSessionIds.delete(id);
+        delete pinnedSessionCwds[id];
+      }
+    }
+  }
+  _savePinnedSessions();
+  return { ok: true };
 });
 
 ipcMain.handle("settings:list-agents", () => {
@@ -1618,6 +1808,394 @@ function openSettingsWindow() {
   settingsWindow.on("closed", () => {
     settingsWindow = null;
   });
+}
+
+// Pre-populate the sessions Map from disk at startup so the Sessions tab
+// shows sessions immediately without waiting for hook events to fire.
+//
+// Strategy (two passes, safest-first):
+//   1. Exact match: for each pinned session ID, find its JSONL file → guaranteed correct
+//   2. Recent: for each project dir, pick the most recent JSONL (last 8h) → one per project
+//
+// Session IDs are JSONL filenames, so pass 1 is O(dirs) lookup with no ambiguity.
+// ── Startup session scan ────────────────────────────────────────────────────────
+// Runs once after app ready. For each pinned session with a stored sourcePid,
+// resolves the editor (process name) and terminal hwnd via Get-Process.
+// sourcePid = the terminal app PID (antigravity, obsidian, cmd, claude) — long-lived.
+// Stores result in pinnedSessionCwds so chat routing works before any hook fires.
+function _startupSessionScan() {
+  const { execFile } = require("child_process");
+  const targets = [];
+  for (const id of pinnedSessionIds) {
+    const meta = pinnedSessionCwds[id];
+    if (meta && meta.sourcePid > 0 && !meta.editor) {
+      targets.push({ id, pid: meta.sourcePid });
+    }
+  }
+  if (!targets.length) return;
+
+  // Build "pid:sessionId" pairs for the PS script
+  const pidMap = targets.map(t => `${t.pid}:${t.id}`).join(",");
+  const ps = `
+$items = "${pidMap}" -split ","
+foreach ($item in $items) {
+  if (-not $item) { continue }
+  $colonIdx = $item.LastIndexOf(":")
+  $pid_ = [int]$item.Substring(0, $colonIdx)
+  $sid = $item.Substring($colonIdx + 1)
+  $p = Get-Process -Id $pid_ -EA 0
+  if ($p -and $p.MainWindowHandle -ne [IntPtr]::Zero) {
+    Write-Output "$sid|$($p.ProcessName.ToLower())|$($p.MainWindowHandle.ToInt64())"
+  }
+}`;
+  setTimeout(() => {
+    execFile("powershell", ["-NoProfile", "-NonInteractive", "-Command", ps],
+      { windowsHide: true },
+      (err, stdout) => {
+        if (!stdout || !stdout.trim()) return;
+        let changed = false;
+        for (const line of stdout.trim().split(/\r?\n/)) {
+          const parts = line.split("|");
+          if (parts.length < 3) continue;
+          const [sid, procName, hwndStr] = parts;
+          if (!sid || !procName) continue;
+          const hwnd = parseInt(hwndStr, 10);
+          if (!hwnd || hwnd <= 0) continue;
+          // Update in-memory session if it exists (may not yet, hooks haven't fired)
+          const s = sessions.get(sid);
+          if (s && !s.editor) { s.editor = procName; s.terminalHwnd = hwnd; }
+          // Always update pinnedSessionCwds — this is what chat.js fallback reads
+          if (pinnedSessionIds.has(sid)) {
+            const existing = pinnedSessionCwds[sid] || {};
+            if (!existing.editor || existing.editor !== procName) {
+              pinnedSessionCwds[sid] = { ...existing, editor: procName };
+              changed = true;
+            }
+          }
+        }
+        if (changed) _savePinnedSessions();
+      }
+    );
+  }, 1500); // wait for app init to settle
+}
+
+function _preseedSessionsFromDisk() {
+  try {
+    const fsSync = require("fs");
+    const os = require("os");
+    const claudeDir = path.join(os.homedir(), ".claude", "projects");
+    if (!fsSync.existsSync(claudeDir)) return;
+
+    const CUTOFF_MS = 24 * 60 * 60 * 1000; // 24 hours for recent-session scan
+    // Minimum dashes in encoded dir name — just excludes weird root entries like "C---c"
+    // Routing is protected from non-editor windows by EDITOR_CLASSES in chat.js
+    const MIN_DASHES = 2;
+    const now = Date.now();
+
+    // Decode an encoded Claude project dir name back to the real filesystem path.
+    // Encoding: '\' ':' '_' '~' all become '-', making it ambiguous.
+    // Recursive search: at each position, try combining 1..N remaining segments
+    // using different joining chars (-  _  ~) until we find a path that exists on disk.
+    function cwdFromProjectDir(dirName) {
+      try {
+        // "C--X-Y-Z" → "C:\X-Y-Z", then split on "-"
+        const withDrive = dirName.replace(/^([A-Za-z])--/, "$1:\\");
+        const segs = withDrive.split("-");
+        const JOIN_CHARS = ["-", "_", "~"];
+
+        function search(idx, base) {
+          if (idx >= segs.length) return base;
+          const remaining = segs.length - idx;
+          for (let n = 1; n <= remaining; n++) {
+            const slice = segs.slice(idx, idx + n);
+            const isLast = (idx + n === segs.length);
+            for (const jc of JOIN_CHARS) {
+              const comp = slice.join(jc);
+              const full = base + "\\" + comp;
+              try {
+                if (isLast) {
+                  if (fsSync.existsSync(full)) return full;
+                } else {
+                  if (fsSync.statSync(full).isDirectory()) {
+                    const found = search(idx + n, full);
+                    if (found) return found;
+                  }
+                }
+              } catch {}
+            }
+          }
+          return null;
+        }
+
+        const result = search(1, segs[0]);
+        if (result) return result;
+        return segs[segs.length - 1] || dirName; // display fallback
+      } catch { return dirName.split("-").pop() || dirName; }
+    }
+
+    let projectDirs;
+    try {
+      projectDirs = fsSync.readdirSync(claudeDir, { withFileTypes: true })
+        .filter(d => d.isDirectory())
+        .map(d => d.name);
+    } catch { return; }
+
+    // Build a flat index: sessionId → { cwd, mtimeMs }
+    // Pass 1: pinned + selected session IDs — always loaded, no time cutoff
+    const _persistedIds = new Set([...pinnedSessionIds, ...selectedSessionIds]);
+    for (const pinnedId of _persistedIds) {
+      if (sessions.get(pinnedId)) continue; // already in Map (from hook)
+      for (const projectDir of projectDirs) {
+        const filePath = path.join(claudeDir, projectDir, pinnedId + ".jsonl");
+        try {
+          const stat = fsSync.statSync(filePath);
+          // Prefer the saved cwd/editor/sourcePid from pinnedSessionCwds (exact real path) over
+          // the decoded dir name, which can be ambiguous for multi-word folders.
+          const _metaPin = pinnedSessionCwds[pinnedId] || {};
+          const _metaSel = selectedSessionMeta[pinnedId] || {};
+          const cwd = _metaPin.cwd || _metaSel.cwd || cwdFromProjectDir(projectDir);
+          const editor = _metaPin.editor || _metaSel.editor || null;
+          const sourcePid = _metaPin.sourcePid || _metaSel.sourcePid || null;
+          sessions.set(pinnedId, {
+            state: "idle",
+            updatedAt: Date.now(),
+            sourcePid,
+            cwd,
+            editor,
+            pidChain: null,
+            agentPid: null,
+            agentId: "claude-code",
+            host: null,
+            headless: false,
+            pidReachable: false,
+            preseeded: true,
+            displayHint: null,
+            resumeState: null,
+          });
+          break; // found it, stop scanning dirs for this session
+        } catch {}
+      }
+    }
+
+    // Ghost pass: selected/pinned sessions not found on disk (vault moved, .jsonl deleted, etc.)
+    // Create stub entries from saved metadata so they always appear in the picker.
+    for (const id of _persistedIds) {
+      if (sessions.get(id)) continue; // found in Pass 1
+      const meta = pinnedSessionCwds[id] || selectedSessionMeta[id] || {};
+      if (!meta.cwd && !meta.editor) continue; // no useful metadata, skip
+      sessions.set(id, {
+        state: "idle",
+        updatedAt: 0,
+        sourcePid: meta.sourcePid || null,
+        cwd: meta.cwd || "",
+        editor: meta.editor || null,
+        pidChain: null,
+        agentPid: null,
+        agentId: "claude-code",
+        host: null,
+        headless: false,
+        pidReachable: false,
+        preseeded: true,
+        displayHint: null,
+        resumeState: null,
+      });
+    }
+
+    // Pass 2: one most-recent session per UNIQUE FOLDER NAME (for non-pinned visibility)
+    // Multiple project dirs can decode to the same folder name (Desktop, iCloud, OneDrive
+    // variants of the same project). Keep only the most recently active one per name.
+    // Skip shallow dirs (home dir, root, etc.) that would match generic window titles.
+    const pass2Candidates = new Map(); // folderName → { sessionId, cwd, mtimeMs }
+
+    for (const projectDir of projectDirs) {
+      if ((projectDir.match(/-/g) || []).length < MIN_DASHES) continue;
+      const projectPath = path.join(claudeDir, projectDir);
+      let files;
+      try { files = fsSync.readdirSync(projectPath); } catch { continue; }
+
+      let newest = null;
+      for (const file of files) {
+        if (!file.endsWith(".jsonl")) continue;
+        const filePath = path.join(projectPath, file);
+        try {
+          const stat = fsSync.statSync(filePath);
+          if (now - stat.mtimeMs > CUTOFF_MS) continue;
+          if (!newest || stat.mtimeMs > newest.mtimeMs) newest = { file, mtimeMs: stat.mtimeMs };
+        } catch {}
+      }
+      if (!newest) continue;
+
+      const sessionId = newest.file.replace(".jsonl", "");
+      if (sessions.get(sessionId)) continue; // already registered (pass 1 or hook)
+
+      const cwd = cwdFromProjectDir(projectDir);
+      // Use the raw encoded last segment for dedup — same project in Desktop/iCloud/OneDrive
+      // all end with the same segment (e.g. "-P" for Project_P, "-jpate" for jpate).
+      const rawLastSeg = projectDir.split("-").pop().toLowerCase();
+      const existing = pass2Candidates.get(rawLastSeg);
+      if (!existing || newest.mtimeMs > existing.mtimeMs) {
+        pass2Candidates.set(rawLastSeg, { sessionId, cwd, mtimeMs: newest.mtimeMs });
+      }
+    }
+
+    for (const { sessionId, cwd } of pass2Candidates.values()) {
+      if (sessions.get(sessionId)) continue;
+      sessions.set(sessionId, {
+        state: "idle",
+        updatedAt: Date.now(),
+        sourcePid: null,
+        cwd,
+        editor: null,
+        pidChain: null,
+        agentPid: null,
+        agentId: "claude-code",
+        host: null,
+        headless: false,
+        pidReachable: false,
+        preseeded: true,
+        displayHint: null,
+        resumeState: null,
+      });
+    }
+  } catch (err) {
+    console.warn("Clawd: preseed sessions error:", err.message);
+  }
+}
+
+// Scan ALL running Claude Code node processes and create synthetic session entries
+// for any that aren't already tracked. Covers sessions opened before Clawd
+// or sessions with no JSONL yet (no prompts sent).
+//
+// Uses PowerShell (Get-CimInstance) to enumerate node.exe processes, then
+// Git Bash /proc/{ppid}/cwd to read the parent shell's working directory.
+function _scanActiveClaudeProcesses() {
+  if (!isWin) return;
+  const { spawnSync } = require("child_process");
+  const fsSync = require("fs");
+
+  try {
+    // PowerShell: find real Claude Code terminal sessions.
+    // Claude Desktop = the claude.exe with a GUI window. Its internal worker children
+    // all have ppid == Claude Desktop PID. Real terminal sessions have a different parent.
+    const psResult = spawnSync("powershell", [
+      "-NoProfile", "-NonInteractive", "-Command",
+      `$cdPid = 0;` +
+      `$cdp = Get-Process -Name claude -EA 0 | Where-Object {$_.MainWindowHandle -ne [IntPtr]::Zero} | Select-Object -First 1;` +
+      `if ($cdp) { $cdPid = $cdp.Id };` +
+      `Get-CimInstance Win32_Process -Filter "Name='claude.exe'" |` +
+      ` Where-Object {$_.CommandLine -ne $null -and $_.ProcessId -ne $cdPid -and $_.ParentProcessId -ne $cdPid} |` +
+      ` ForEach-Object { "$($_.ProcessId)|$($_.ParentProcessId)" }`,
+    ], { timeout: 6000, encoding: "utf8", windowsHide: true });
+
+    const psOut = (psResult.stdout || "") + "";
+    const claudeProcs = [];
+    for (const line of psOut.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.includes("|")) continue;
+      const parts = trimmed.split("|");
+      const pid = parseInt(parts[0]);
+      const ppid = parseInt(parts[1]);
+      if (!isNaN(pid) && pid > 0) claudeProcs.push({ pid, ppid });
+    }
+
+    if (claudeProcs.length === 0) return;
+
+    // Gather all PIDs already tracked via hooks or prior scans
+    const trackedPids = new Set();
+    for (const [, s] of sessions) {
+      if (s.sourcePid) trackedPids.add(s.sourcePid);
+    }
+
+    const untracked = claudeProcs.filter(p => !trackedPids.has(p.pid));
+    if (untracked.length === 0) return;
+
+    // Try to get CWD from the parent shell process using Git Bash /proc
+    // Git Bash provides /proc/{pid}/cwd as a symlink to the real directory
+    const ppids = [...new Set(untracked.map(p => p.ppid))];
+    const cwdByPpid = {};
+
+    const gitBashPaths = [
+      "C:\\Program Files\\Git\\bin\\bash.exe",
+      "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+    ];
+    const gitBash = gitBashPaths.find(p => fsSync.existsSync(p));
+
+    if (gitBash) {
+      try {
+        // One line per ppid: "pid|cwd\n"
+        const script = ppids.map(ppid =>
+          `printf '%s|' ${ppid}; readlink /proc/${ppid}/cwd 2>/dev/null; printf '\\n'`
+        ).join("; ");
+        const bashResult = spawnSync(gitBash, ["-c", script],
+          { timeout: 3000, encoding: "utf8", windowsHide: true });
+        const bashOut = (bashResult.stdout || "") + "";
+        for (const line of bashOut.split("\n")) {
+          const idx = line.indexOf("|");
+          if (idx < 0) continue;
+          const ppid = parseInt(line.slice(0, idx));
+          const cwd = line.slice(idx + 1).trim();
+          if (!isNaN(ppid) && cwd) cwdByPpid[ppid] = cwd;
+        }
+      } catch {}
+    }
+
+    // Convert Unix-style path from Git Bash (/c/Users/jacks) to Windows (C:\Users\jacks)
+    function normCwd(raw) {
+      if (!raw) return "";
+      const m = raw.match(/^\/([a-zA-Z])\/(.*)/);
+      if (m) return m[1].toUpperCase() + ":\\" + m[2].replace(/\//g, "\\");
+      return raw.replace(/\//g, "\\");
+    }
+
+    for (const { pid, ppid } of untracked) {
+      const syntheticId = `proc-${pid}`;
+      if (sessions.has(syntheticId)) continue; // already here from last scan
+      const cwd = normCwd(cwdByPpid[ppid] || "");
+      sessions.set(syntheticId, {
+        state: "idle",
+        updatedAt: Date.now(),
+        sourcePid: pid,
+        cwd,
+        editor: null,
+        pidChain: null,
+        agentPid: null,
+        agentId: "claude-code",
+        host: null,
+        headless: false,
+        pidReachable: true,  // trust process is alive (we just found it)
+        preseeded: true,
+        displayHint: null,
+        resumeState: null,
+      });
+    }
+  } catch (err) {
+    console.warn("Clawd: claude process scan error:", err.message);
+  }
+}
+
+// Watch ~/.claude/projects/ for new JSONL files so sessions appear the moment
+// any prompt is sent, rather than waiting for the 30s poll interval.
+let _projectsDirWatcher = null;
+function _watchClaudeProjectsDir() {
+  try {
+    const fsSync = require("fs");
+    const os = require("os");
+    const claudeDir = path.join(os.homedir(), ".claude", "projects");
+    if (!fsSync.existsSync(claudeDir)) return;
+
+    let debounceTimer = null;
+    _projectsDirWatcher = fsSync.watch(claudeDir, { recursive: true }, (evt, filename) => {
+      if (!filename || !filename.endsWith(".jsonl")) return;
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        _preseedSessionsFromDisk();
+        _scanActiveClaudeProcesses();
+      }, 500);
+    });
+    app.on("quit", () => { try { _projectsDirWatcher && _projectsDirWatcher.close(); } catch {} });
+  } catch (err) {
+    console.warn("Clawd: fs.watch on projects dir failed:", err.message);
+  }
 }
 
 function createWindow() {
@@ -1784,6 +2362,8 @@ function createWindow() {
       syncHitWin();
       if (bubbleFollowPet) repositionFloatingBubbles();
       else repositionUpdateBubble();
+      if (_chat && _chat.reposition) _chat.reposition();
+      if (_response && _response.reposition) _response.reposition();
     };
     win.on("move", syncFloatingWindows);
     win.on("resize", syncFloatingWindows);
@@ -1806,9 +2386,11 @@ function createWindow() {
 
   // Ctrl+right-click → cycle pinned session
   ipcMain.on("cycle-pinned-session", () => {
-    // Build sorted session list (same order as sessions tab)
+    // Cycle through the selected pool. If nothing selected, cycle all sessions.
+    const pool = selectedSessionIds.size > 0 ? selectedSessionIds : null;
     const list = [];
     for (const [id, s] of sessions) {
+      if (pool && !pool.has(id)) continue;
       list.push({ id, updatedAt: s.updatedAt || 0, cwd: s.cwd || "" });
     }
     if (list.length === 0) return;
@@ -1824,12 +2406,12 @@ function createWindow() {
     pinnedSessionIds.clear();
     Object.keys(pinnedSessionCwds).forEach(k => delete pinnedSessionCwds[k]);
     pinnedSessionIds.add(next.id);
-    if (next.cwd) pinnedSessionCwds[next.id] = next.cwd;
+    pinnedSessionCwds[next.id] = { cwd: next.cwd || "", editor: next.editor || null, sourcePid: next.sourcePid || 0 };
     _savePinnedSessions();
     _resolvePinnedState();
 
     // Flash session name on Clawd via renderer
-    const label = next.cwd ? next.cwd.split(/[\\/]/).pop() : next.id.slice(0, 8);
+    const label = sessionNames[next.id] || (next.cwd ? next.cwd.split(/[\\/]/).pop() : next.id.slice(0, 8));
     if (win && !win.isDestroyed()) {
       win.webContents.send("show-toast", `📌 ${label}`);
     }
@@ -1837,6 +2419,7 @@ function createWindow() {
 
   _chat.registerIpc();
   _response.registerIpc();
+  _sessionPicker.registerIpc();
 
   ipcMain.on("move-window-by", (event, dx, dy) => {
     if (_mini.getMiniMode() || _mini.getMiniTransitioning()) return;
@@ -2095,6 +2678,7 @@ function activateTheme(themeId, variantId) {
   _follower.stop();
   _chat.cleanup();
   _response.cleanup();
+  _sessionPicker.cleanup();
   _mini.cleanup();
   // ⚠️ Don't clear pendingPermissions — bubbles are independent BrowserWindows
   // ⚠️ Don't clear sessions — keep active session tracking
@@ -2247,6 +2831,11 @@ if (!gotTheLock) {
     updateDebugLog = path.join(app.getPath("userData"), "update-debug.log");
     sessionDebugLog = path.join(app.getPath("userData"), "session-debug.log");
     createWindow();
+
+    // Sessions only appear when Claude Code fires a hook — no auto-scanning.
+    // BUT: run a one-time startup scan to resolve editor + hwnd for pinned sessions
+    // from their stored sourcePid (terminal app PID — long-lived, survives Clawd restarts).
+    if (isWin) _startupSessionScan();
 
     // Register global shortcut for toggling pet visibility
     registerToggleShortcut();

@@ -1516,8 +1516,9 @@ async function renderSessionsTab(parent) {
   const clearBtn = document.createElement("button");
   clearBtn.className = "btn-secondary";
   clearBtn.style.cssText = "font-size:11px;padding:2px 8px;";
-  clearBtn.textContent = "Clear all";
+  clearBtn.textContent = "Clear stale";
   clearBtn.addEventListener("click", async () => {
+    await window.settingsAPI.clearStaleSessions();
     await window.settingsAPI.clearPinnedSessions();
     refresh();
   });
@@ -1530,13 +1531,15 @@ async function renderSessionsTab(parent) {
 
   async function refresh() {
     if (activeTab !== "sessions") { clearInterval(sessionsPollTimer); sessionsPollTimer = null; return; }
-    const { sessions, pinnedSessionIds } = await window.settingsAPI.listSessions();
+    const { sessions, pinnedSessionIds, selectedSessionIds } = await window.settingsAPI.listSessions();
     const pinned = new Set(pinnedSessionIds || []);
+    const selected = new Set(selectedSessionIds || []);
 
+    const selectedCount = selected.size;
     countLabel.textContent = sessions.length
-      ? `${sessions.length} session${sessions.length !== 1 ? "s" : ""}${pinned.size ? `  ·  ${pinned.size} selected` : "  ·  all active"}`
+      ? `${sessions.length} session${sessions.length !== 1 ? "s" : ""}${selectedCount ? `  ·  ${selectedCount} in cycle` : "  ·  none selected"}`
       : "No sessions";
-    clearBtn.style.display = pinned.size ? "" : "none";
+    clearBtn.style.display = sessions.length ? "" : "none";
 
     list.innerHTML = "";
 
@@ -1549,25 +1552,32 @@ async function renderSessionsTab(parent) {
     }
 
     for (const s of sessions) {
-      const isPinned = pinned.has(s.id);
+      const isSelected = selected.has(s.id); // in cycling pool
+      const isActive = pinned.has(s.id);     // currently pinned/active
       const isOffline = !!s.offline;
       const stateLabel = SESSION_STATE_LABEL[s.state] || "Idle";
       const stateColor = SESSION_STATE_COLOR[s.state] || "#71717a";
       const folderName = s.cwd ? s.cwd.split(/[\\/]/).pop() : s.id.slice(0, 8);
 
+      // Row: selected = teal border, active = orange glow on top of teal
+      const borderColor = isActive ? "#d97757" : isSelected ? "#2dd4bf" : "var(--card-border)";
+      const bg = isActive ? "rgba(217,119,87,0.08)" : isSelected ? "rgba(45,212,191,0.05)" : "var(--input-bg)";
+
       const row = document.createElement("div");
       row.style.cssText = `display:flex;align-items:center;gap:12px;padding:10px 14px;
-        background:${isPinned && !isOffline ? "rgba(217,119,87,0.08)" : "var(--input-bg)"};
-        border:1.5px solid ${isPinned ? (isOffline ? "rgba(217,119,87,0.35)" : "#d97757") : "var(--card-border)"};
+        background:${bg};
+        border:1.5px solid ${isOffline && isSelected ? "rgba(45,212,191,0.4)" : borderColor};
         border-radius:10px;cursor:pointer;transition:border-color 0.15s,background 0.15s;
         opacity:${isOffline ? "0.6" : "1"};`;
 
-      // Checkmark
+      // Checkbox — teal when selected, orange badge overlay when active
       const check = document.createElement("span");
-      check.style.cssText = `width:18px;height:18px;border-radius:5px;border:2px solid ${isPinned ? "#d97757" : "var(--card-border)"};
-        background:${isPinned ? "#d97757" : "transparent"};display:flex;align-items:center;justify-content:center;
+      check.style.cssText = `width:18px;height:18px;border-radius:5px;
+        border:2px solid ${isSelected ? "#2dd4bf" : "var(--card-border)"};
+        background:${isSelected ? "#2dd4bf" : "transparent"};
+        display:flex;align-items:center;justify-content:center;
         flex-shrink:0;transition:all 0.15s;font-size:11px;color:#fff;font-weight:700;`;
-      check.textContent = isPinned ? "✓" : "";
+      check.textContent = isSelected ? "✓" : "";
       row.appendChild(check);
 
       // State dot
@@ -1591,19 +1601,39 @@ async function renderSessionsTab(parent) {
 
       row.appendChild(label);
 
-      // State badge
-      const badge = document.createElement("span");
-      badge.style.cssText = `font-size:11px;font-weight:600;color:${stateColor};flex-shrink:0;`;
-      badge.textContent = stateLabel;
-      row.appendChild(badge);
+      // Right side: active badge + state
+      const rightSide = document.createElement("div");
+      rightSide.style.cssText = "display:flex;flex-direction:column;align-items:flex-end;gap:3px;flex-shrink:0;";
 
-      // Toggle on click
+      if (isActive) {
+        const activeBadge = document.createElement("span");
+        activeBadge.style.cssText = "font-size:10px;font-weight:700;color:#d97757;background:rgba(217,119,87,0.15);padding:1px 5px;border-radius:4px;";
+        activeBadge.textContent = "ACTIVE";
+        rightSide.appendChild(activeBadge);
+      }
+
+      const badge = document.createElement("span");
+      badge.style.cssText = `font-size:11px;font-weight:600;color:${stateColor};`;
+      badge.textContent = stateLabel;
+      rightSide.appendChild(badge);
+      row.appendChild(rightSide);
+
+      // Click = toggle in/out of cycling pool
       row.addEventListener("click", async () => {
-        await window.settingsAPI.pinSession(s.id);
+        await window.settingsAPI.toggleSelectedSession(s.id);
         refresh();
       });
 
       list.appendChild(row);
+    }
+
+    // Hint
+    if (sessions.length && !list.querySelector(".cycle-hint")) {
+      const hint = document.createElement("p");
+      hint.className = "cycle-hint";
+      hint.style.cssText = "color:var(--text-sub);font-size:11px;margin-top:8px;text-align:center;";
+      hint.textContent = "Click sessions to add to cycle pool · Ctrl+Right-click Clawd to switch";
+      list.appendChild(hint);
     }
   }
 

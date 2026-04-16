@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: transparent;
+    overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    -webkit-app-region: no-drag;
+    user-select: none;
+  }
+  .card {
+    background: #1c1c1e;
+    border: 1.5px solid rgba(255,255,255,0.10);
+    border-radius: 14px;
+    padding: 10px 8px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.55);
+    opacity: 0;
+    transform: scale(0.92) translateY(6px);
+    transition: opacity 0.18s ease, transform 0.18s ease;
+    min-width: 260px;
+    max-width: 340px;
+  }
+  .card.visible { opacity: 1; transform: scale(1) translateY(0); }
+  .card.hiding  { opacity: 0; transform: scale(0.92) translateY(6px); }
+  .header {
+    font-size: 10px; font-weight: 700;
+    color: rgba(255,255,255,0.30);
+    text-transform: uppercase; letter-spacing: 0.06em;
+    padding: 2px 8px 8px;
+  }
+  .session-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 8px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 0.1s;
+    position: relative;
+  }
+  .session-row:hover { background: rgba(255,255,255,0.06); }
+  .session-row:hover .rename-btn { opacity: 1; }
+  .check {
+    width: 16px; height: 16px; border-radius: 4px;
+    border: 2px solid rgba(255,255,255,0.22);
+    background: transparent;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+    font-size: 10px; color: #fff; font-weight: 700;
+    transition: all 0.12s;
+  }
+  .check.selected { background: #2dd4bf; border-color: #2dd4bf; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+  .label { flex: 1; min-width: 0; }
+  .name {
+    font-size: 13px; font-weight: 500;
+    color: rgba(255,255,255,0.88);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .meta {
+    font-size: 10px; color: rgba(255,255,255,0.30);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    margin-top: 1px;
+  }
+  .active-badge {
+    font-size: 9px; font-weight: 700; color: #d97757;
+    background: rgba(217,119,87,0.15);
+    padding: 1px 5px; border-radius: 4px; flex-shrink: 0;
+  }
+  .rename-btn {
+    opacity: 0; transition: opacity 0.1s;
+    background: none; border: none; cursor: pointer;
+    color: rgba(255,255,255,0.35); font-size: 13px;
+    padding: 2px 4px; border-radius: 4px; flex-shrink: 0;
+    line-height: 1;
+  }
+  .rename-btn:hover { color: rgba(255,255,255,0.7); background: rgba(255,255,255,0.08); }
+
+  /* Target routing pill */
+  .target-pill {
+    font-size: 9px; font-weight: 700; letter-spacing: 0.04em;
+    padding: 2px 5px; border-radius: 4px; border: none;
+    cursor: pointer; flex-shrink: 0; color: #fff;
+    opacity: 0.45; transition: opacity 0.12s, filter 0.12s;
+    line-height: 1.4;
+  }
+  .target-pill.set { opacity: 0.85; }
+  .session-row:hover .target-pill { opacity: 0.7; }
+  .session-row:hover .target-pill.set { opacity: 1; }
+  .target-pill:hover { filter: brightness(1.25); opacity: 1 !important; }
+
+  /* Inline rename input */
+  .rename-input {
+    flex: 1; background: rgba(255,255,255,0.08);
+    border: 1.5px solid #2dd4bf; border-radius: 6px;
+    color: rgba(255,255,255,0.9); font-size: 13px; font-weight: 500;
+    padding: 2px 7px; outline: none;
+    min-width: 0;
+  }
+  .rename-actions {
+    display: flex; gap: 4px; flex-shrink: 0;
+  }
+  .rename-save, .rename-cancel {
+    background: none; border: none; cursor: pointer;
+    font-size: 12px; padding: 2px 5px; border-radius: 4px;
+  }
+  .rename-save  { color: #2dd4bf; }
+  .rename-cancel { color: rgba(255,255,255,0.35); }
+  .rename-save:hover  { background: rgba(45,212,191,0.15); }
+  .rename-cancel:hover { background: rgba(255,255,255,0.08); }
+
+  .empty {
+    font-size: 12px; color: rgba(255,255,255,0.32);
+    padding: 8px 10px; text-align: center;
+  }
+  .hint {
+    font-size: 10px; color: rgba(255,255,255,0.20);
+    text-align: center;
+    padding: 8px 8px 2px;
+    border-top: 1px solid rgba(255,255,255,0.06);
+    margin-top: 6px;
+  }
+  .close-btn {
+    position: absolute; top: 7px; right: 8px;
+    background: none; border: none; cursor: pointer;
+    color: rgba(255,255,255,0.35); font-size: 16px; line-height: 1;
+    padding: 2px 5px; border-radius: 4px;
+    transition: color 0.1s, background 0.1s;
+  }
+  .close-btn:hover { color: rgba(255,255,255,0.8); background: rgba(255,255,255,0.08); }
+  .card { position: relative; }
+  /* 15s countdown bar */
+  .timer-bar {
+    height: 2px; background: rgba(45,212,191,0.25);
+    border-radius: 0 0 14px 14px; margin: 6px -8px -10px;
+    overflow: hidden;
+  }
+  .timer-bar-fill {
+    height: 100%; background: #2dd4bf;
+    width: 100%;
+    transform-origin: left;
+  }
+  @keyframes shrink15 { from { transform: scaleX(1); } to { transform: scaleX(0); } }
+</style>
+</head>
+<body>
+<div class="card" id="card">
+  <button class="close-btn" id="closeBtn">×</button>
+  <div class="header">Sessions — click to add to cycle</div>
+  <div id="list"></div>
+  <div class="hint">Ctrl+Right-click Clawd to cycle · click to dismiss</div>
+  <div class="timer-bar"><div class="timer-bar-fill" id="timerFill"></div></div>
+</div>
+<script>
+const STATE_COLOR = {
+  working: "#f59e0b", thinking: "#818cf8", juggling: "#a78bfa",
+  idle: "#6b7280", sleeping: "#374151", attention: "#34d399",
+  error: "#f87171", notification: "#60a5fa",
+};
+
+const TARGETS = [null, "antigravity", "obsidian", "cmd", "claude"];
+const TARGET_LABEL = {
+  null: "•••", antigravity: "AG", obsidian: "OB", cmd: "PSH", claude: "CLD",
+};
+const TARGET_COLOR = {
+  null: "#4b5563", antigravity: "#2dd4bf", obsidian: "#a78bfa", cmd: "#94a3b8", claude: "#fb923c",
+};
+
+const card  = document.getElementById("card");
+const listEl = document.getElementById("list");
+
+let currentSelected = new Set();
+let currentPinned   = new Set();
+let allSessions     = [];
+
+function render() {
+  listEl.innerHTML = "";
+  if (!allSessions.length) {
+    const e = document.createElement("div");
+    e.className = "empty";
+    e.textContent = "No active sessions yet";
+    listEl.appendChild(e);
+    return;
+  }
+
+  for (const s of allSessions) {
+    const isSelected = currentSelected.has(s.id);
+    const isActive   = currentPinned.has(s.id);
+    const folderName = s.cwd ? s.cwd.split(/[\\/]/).pop() : s.id.slice(0, 8);
+    const displayName = s.customName || folderName;
+    const stateColor  = STATE_COLOR[s.state] || "#6b7280";
+
+    const row = document.createElement("div");
+    row.className = "session-row";
+
+    // ── Checkbox ──
+    const check = document.createElement("div");
+    check.className = "check" + (isSelected ? " selected" : "");
+    check.textContent = isSelected ? "✓" : "";
+    check.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      await window.pickerAPI.toggle(s.id);
+      if (currentSelected.has(s.id)) { currentSelected.delete(s.id); check.className = "check"; check.textContent = ""; }
+      else { currentSelected.add(s.id); check.className = "check selected"; check.textContent = "✓"; }
+    });
+    row.appendChild(check);
+
+    // ── State dot ──
+    const dot = document.createElement("div");
+    dot.className = "dot";
+    dot.style.background = stateColor;
+    row.appendChild(dot);
+
+    // ── Label ──
+    const label = document.createElement("div");
+    label.className = "label";
+    const nameEl = document.createElement("div");
+    nameEl.className = "name";
+    nameEl.textContent = displayName + (s.host ? ` @ ${s.host}` : "");
+    label.appendChild(nameEl);
+    const metaEl = document.createElement("div");
+    metaEl.className = "meta";
+    metaEl.textContent = s.cwd || s.id.slice(0, 20);
+    label.appendChild(metaEl);
+    row.appendChild(label);
+
+    // ── Active badge ──
+    if (isActive) {
+      const badge = document.createElement("div");
+      badge.className = "active-badge";
+      badge.textContent = "ACTIVE";
+      row.appendChild(badge);
+    }
+
+    // ── Rename pencil ──
+    const renameBtn = document.createElement("button");
+    renameBtn.className = "rename-btn";
+    renameBtn.title = "Rename";
+    renameBtn.textContent = "✏️";
+    renameBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      startRename(row, label, nameEl, s);
+    });
+    row.appendChild(renameBtn);
+
+    // ── Target routing pill ──
+    const targetPill = document.createElement("button");
+    const curTarget = s.target || null;
+    targetPill.className = "target-pill" + (curTarget ? " set" : "");
+    targetPill.style.background = TARGET_COLOR[curTarget] || TARGET_COLOR[null];
+    targetPill.textContent = TARGET_LABEL[curTarget] || TARGET_LABEL[null];
+    targetPill.title = curTarget ? `Routes to: ${curTarget} — click to change` : "Click to assign routing target";
+    targetPill.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const idx = TARGETS.indexOf(s.target || null);
+      const next = TARGETS[(idx + 1) % TARGETS.length];
+      s.target = next;
+      targetPill.textContent = TARGET_LABEL[next] || TARGET_LABEL[null];
+      targetPill.style.background = TARGET_COLOR[next] || TARGET_COLOR[null];
+      targetPill.className = "target-pill" + (next ? " set" : "");
+      targetPill.title = next ? `Routes to: ${next} — click to change` : "Click to assign routing target";
+      await window.pickerAPI.setTarget(s.id, next);
+    });
+    row.appendChild(targetPill);
+
+    listEl.appendChild(row);
+  }
+}
+
+function startRename(row, label, nameEl, s) {
+  const folderName  = s.cwd ? s.cwd.split(/[\\/]/).pop() : s.id.slice(0, 8);
+  const currentName = s.customName || folderName;
+
+  // Swap label for input
+  label.style.display = "none";
+
+  const input = document.createElement("input");
+  input.className = "rename-input";
+  input.value = currentName;
+  input.placeholder = folderName;
+
+  const actions = document.createElement("div");
+  actions.className = "rename-actions";
+
+  const saveBtn = document.createElement("button");
+  saveBtn.className = "rename-save";
+  saveBtn.textContent = "✓";
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.className = "rename-cancel";
+  cancelBtn.textContent = "✕";
+
+  actions.appendChild(saveBtn);
+  actions.appendChild(cancelBtn);
+
+  // Insert before the rename pencil button
+  row.insertBefore(input, row.lastChild);
+  row.insertBefore(actions, row.lastChild);
+
+  input.focus();
+  input.select();
+
+  async function save() {
+    const newName = input.value.trim();
+    s.customName = newName || null;
+    await window.pickerAPI.rename(s.id, newName);
+    cleanup();
+    nameEl.textContent = (newName || folderName) + (s.host ? ` @ ${s.host}` : "");
+  }
+
+  function cancel() { cleanup(); }
+
+  function cleanup() {
+    input.remove();
+    actions.remove();
+    label.style.display = "";
+  }
+
+  saveBtn.addEventListener("click", (e) => { e.stopPropagation(); save(); });
+  cancelBtn.addEventListener("click", (e) => { e.stopPropagation(); cancel(); });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.stopPropagation(); save(); }
+    if (e.key === "Escape") { e.stopPropagation(); cancel(); }
+  });
+  input.addEventListener("click", (e) => e.stopPropagation());
+}
+
+const timerFill = document.getElementById("timerFill");
+
+window.pickerAPI.onShow((data) => {
+  currentSelected = new Set(data.selectedIds || []);
+  currentPinned   = new Set(data.pinnedIds   || []);
+  allSessions     = data.sessions || [];
+  render();
+  // Restart countdown bar
+  timerFill.style.animation = "none";
+  requestAnimationFrame(() => {
+    card.classList.remove("hiding");
+    card.classList.add("visible");
+    window.pickerAPI.reportHeight(card.offsetHeight);
+    // Force reflow then start animation
+    timerFill.getBoundingClientRect();
+    timerFill.style.animation = "shrink15 15s linear forwards";
+  });
+});
+
+// X button
+document.getElementById("closeBtn").addEventListener("click", () => window.pickerAPI.close());
+
+// Click card background (not a row) = dismiss
+card.addEventListener("click", (e) => {
+  if (!e.target.closest(".session-row") && e.target.id !== "closeBtn") {
+    window.pickerAPI.close();
+  }
+});
+</script>
+</body>
+</html>

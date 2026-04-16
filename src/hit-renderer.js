@@ -230,6 +230,8 @@ document.addEventListener("contextmenu", (e) => {
   e.preventDefault();
   if (e.ctrlKey || e.metaKey) {
     window.hitAPI.cyclePinnedSession();
+  } else if (e.shiftKey) {
+    window.hitAPI.showSessionPicker();
   } else {
     window.hitAPI.showContextMenu();
   }

@@ -43,6 +43,7 @@ function getPosition() {
 
 function reposition() {
   if (!chatWin || chatWin.isDestroyed()) return;
+  if (chatWin.isFocused()) return; // don't yank position while user is typing
   const { x, y } = getPosition();
   chatWin.setBounds({ x, y, width: BUBBLE_W, height: measuredH + 4 });
 }
@@ -90,41 +91,51 @@ function sendMessage(msg) {
 
   if (isWin) {
     // Pick best session (pinned first, else most recent)
-    let targetPid = 0, targetCwd = "";
+    let targetCwd = "", targetEditor = "", targetSourcePid = 0, targetHwnd = 0;
     const pinned = ctx.pinnedSessionIds;
     const hasPins = pinned && pinned.size > 0;
     if (ctx.sessions) {
       let latest = 0;
       for (const [id, s] of ctx.sessions) {
         if (hasPins && !pinned.has(id)) continue;
-        if (s.sourcePid && (s.updatedAt || 0) >= latest) {
+        if ((s.updatedAt || 0) >= latest) {
           latest = s.updatedAt || 0;
-          targetPid = s.sourcePid;
           targetCwd = s.cwd || "";
+          targetEditor = s.editor || "";
+          targetSourcePid = s.sourcePid || 0;
+          targetHwnd = s.terminalHwnd || 0;
         }
       }
     }
     // If pins are set but session not yet in Map (e.g. after Clawd restart),
-    // fall back to saved cwd from pinnedSessionCwds
-    if (hasPins && !targetCwd && ctx.pinnedSessionCwds) {
+    // fall back to saved data from pinnedSessionCwds
+    // Fallback: if no sessions registered yet (hooks haven't fired since restart),
+    // read routing metadata from pinnedSessionCwds (persisted from last run)
+    if (hasPins && (!targetCwd || !targetEditor) && ctx.pinnedSessionCwds) {
       for (const id of pinned) {
-        const savedCwd = ctx.pinnedSessionCwds[id];
-        if (savedCwd) { targetCwd = savedCwd; break; }
+        const saved = ctx.pinnedSessionCwds[id];
+        if (saved) {
+          if (!targetCwd)        targetCwd        = saved.cwd        || "";
+          if (!targetEditor)     targetEditor     = saved.editor     || "";
+          if (!targetSourcePid)  targetSourcePid  = saved.sourcePid  || 0;
+          break;
+        }
       }
     }
     // Folder name from cwd for window title matching (e.g. "Project_P", "jpate")
     const folderName = targetCwd ? targetCwd.split(/[\\/]/).pop() : "";
-    try { require("fs").appendFileSync(require("path").join(require("os").homedir(), "AppData", "Roaming", "clawd-on-desk", "clawd-chat-debug.log"), `[${new Date().toISOString()}] targetPid=${targetPid} targetCwd=${targetCwd} folderName=${folderName} pinnedSize=${ctx.pinnedSessionIds ? ctx.pinnedSessionIds.size : "N/A"}\n`); } catch {}
+    try { require("fs").appendFileSync(require("path").join(require("os").homedir(), "AppData", "Roaming", "clawd-on-desk", "clawd-chat-debug.log"), `[${new Date().toISOString()}] editor=${targetEditor} sourcePid=${targetSourcePid} targetCwd=${targetCwd} folderName=${folderName} pinnedSize=${ctx.pinnedSessionIds ? ctx.pinnedSessionIds.size : "N/A"}\n`); } catch {}
 
     // Encode message as base64 UTF-16LE so it survives embedding in the PS script
     const msgB64 = Buffer.from(msg, "utf16le").toString("base64");
 
-    // Strategy:
-    //   1. Claude Desktop (Electron) — PostMessage WM_CHAR to render widget, no focus needed
-    //   2. mintty (Git Bash) — PostMessage WM_CHAR to window
-    //   3. Fallback — clipboard + focus (restores window)
+    // Route by editor (if known) then fall back to window-title search (original approach).
     const ps = `
 $text = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String("${msgB64}"))
+$editor = "${targetEditor}"
+$folderName = "${folderName}"
+$terminalPid = ${targetSourcePid}
+$dbg = "$env:APPDATA\\clawd-on-desk\\clawd-ps-debug.log"
 
 Add-Type @"
 using System;
@@ -138,6 +149,7 @@ public class WinSend {
 
   [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
@@ -147,118 +159,197 @@ public class WinSend {
   [DllImport("user32.dll")] public static extern IntPtr FindWindowEx(IntPtr p, IntPtr a, string c, string t);
   [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte sc, uint fl, UIntPtr ei);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, ref int lpdwProcessId);
+  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint from, uint to, bool attach);
+  [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
+  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
   public delegate bool EnumWindowsDelegate(IntPtr h, IntPtr lp);
 
-  // Inject text via PostMessage WM_CHAR — works on minimized/background windows
-  public static bool PostChars(IntPtr hwnd, string text) {
-    if (hwnd == IntPtr.Zero) return false;
-    foreach (char c in text)
-      PostMessage(hwnd, WM_CHAR, new IntPtr(c), new IntPtr(1));
-    PostMessage(hwnd, WM_KEYDOWN, new IntPtr(VK_RETURN), new IntPtr(1));
-    PostMessage(hwnd, WM_KEYUP,   new IntPtr(VK_RETURN), new IntPtr(0xC0000001));
-    return true;
+  // Find the Chromium render widget child — direct target for WM_CHAR injection
+  public static IntPtr FindRenderWidget(IntPtr parent) {
+    IntPtr rw = FindWindowEx(parent, IntPtr.Zero, "Chrome_RenderWidgetHostHWND", null);
+    if (rw != IntPtr.Zero) return rw;
+    IntPtr child = FindWindowEx(parent, IntPtr.Zero, "Chrome_WidgetWin_1", null);
+    if (child != IntPtr.Zero) {
+      rw = FindWindowEx(child, IntPtr.Zero, "Chrome_RenderWidgetHostHWND", null);
+      if (rw != IntPtr.Zero) return rw;
+    }
+    return parent;
   }
 
-  // Find Claude Desktop top-level window (Electron / Chrome_WidgetWin_1, title "Claude")
+  // Find Claude Desktop: Chrome_WidgetWin_1 with title "Claude"
   public static IntPtr FindClaudeDesktop() {
     IntPtr found = IntPtr.Zero;
     EnumWindows((h, _) => {
       if (!IsWindowVisible(h) && !IsIconic(h)) return true;
       var cls = new StringBuilder(256); GetClassName(h, cls, 256);
       var ttl = new StringBuilder(256); GetWindowText(h, ttl, 256);
-      string c = cls.ToString(), t = ttl.ToString();
-      // Chrome_WidgetWin_1 with title "Claude" (not Clawd or other Electron apps)
-      if (c == "Chrome_WidgetWin_1" && t == "Claude") { found = h; return false; }
+      if (cls.ToString() == "Chrome_WidgetWin_1" && ttl.ToString() == "Claude") { found = h; return false; }
       return true;
     }, IntPtr.Zero);
     return found;
   }
 
-  // Find the Chromium render widget child — target for WM_CHAR injection
-  public static IntPtr FindRenderWidget(IntPtr parent) {
-    IntPtr rw = FindWindowEx(parent, IntPtr.Zero, "Chrome_RenderWidgetHostHWND", null);
-    if (rw != IntPtr.Zero) return rw;
-    // Recurse one level for nested chrome windows
-    IntPtr child = FindWindowEx(parent, IntPtr.Zero, "Chrome_WidgetWin_1", null);
-    if (child != IntPtr.Zero) {
-      rw = FindWindowEx(child, IntPtr.Zero, "Chrome_RenderWidgetHostHWND", null);
-      if (rw != IntPtr.Zero) return rw;
-    }
-    return parent; // fall back to top-level
-  }
-
-  // Find mintty window
-  public static IntPtr FindMintty() {
-    IntPtr found = IntPtr.Zero;
-    EnumWindows((h, _) => {
-      if (!IsWindowVisible(h) && !IsIconic(h)) return true;
-      var cls = new StringBuilder(256); GetClassName(h, cls, 256);
-      if (cls.ToString() == "mintty") { found = h; return false; }
-      return true;
-    }, IntPtr.Zero);
-    return found;
-  }
-
-  public static void FocusWindow(IntPtr h) {
-    if (h == IntPtr.Zero) return;
-    if (IsIconic(h)) { ShowWindow(h, 9); System.Threading.Thread.Sleep(200); }
-    keybd_event(0x12,0,0,UIntPtr.Zero);
-    keybd_event(0x12,0,2,UIntPtr.Zero);
-    SetForegroundWindow(h);
-  }
-
-  // Find first visible window (any class) whose title contains folderName
-  // Skips known system/Clawd windows and background-only windows
+  // Find first visible terminal/editor window whose title contains folderName.
+  // Excludes file explorers (CabinetWClass, ExploreWClass) and system windows.
   public static IntPtr FindWindowByTitle(string folderName) {
     IntPtr found = IntPtr.Zero;
     EnumWindows((h, _) => {
       if (!IsWindowVisible(h) && !IsIconic(h)) return true;
+      var cls = new StringBuilder(128); GetClassName(h, cls, 128);
+      string c = cls.ToString();
+      // Skip file explorer, task manager, tray, etc.
+      if (c == "CabinetWClass" || c == "ExploreWClass" || c == "WorkerW" ||
+          c == "Shell_TrayWnd" || c == "Progman") return true;
       var ttl = new StringBuilder(512); GetWindowText(h, ttl, 512);
       string t = ttl.ToString();
       if (t.Length == 0 || t == "Claude" || t == "Clawd") return true;
-      if (t.IndexOf(folderName, StringComparison.OrdinalIgnoreCase) >= 0) {
-        found = h; return false;
-      }
+      if (t.IndexOf(folderName, StringComparison.OrdinalIgnoreCase) >= 0) { found = h; return false; }
       return true;
     }, IntPtr.Zero);
     return found;
   }
+
+  // Robustly focus a window using AttachThreadInput so keyboard input
+  // actually transfers even from a background/hidden process.
+  public static void FocusWindow(IntPtr h) {
+    if (h == IntPtr.Zero) return;
+    if (IsIconic(h)) { ShowWindow(h, 9); System.Threading.Thread.Sleep(200); }
+    int dummy = 0;
+    uint targetTid = GetWindowThreadProcessId(h, ref dummy);
+    uint myTid = GetCurrentThreadId();
+    keybd_event(0x12, 0, 0, UIntPtr.Zero);
+    keybd_event(0x12, 0, 2, UIntPtr.Zero);
+    SetForegroundWindow(h);
+    BringWindowToTop(h);
+    if (targetTid != 0 && targetTid != myTid) {
+      AttachThreadInput(myTid, targetTid, true);
+      SetFocus(h);
+      AttachThreadInput(myTid, targetTid, false);
+    }
+  }
+
+  // For Electron/Chrome apps: focus the render widget child so keystrokes
+  // land in the web content (terminal pane) rather than the chrome frame.
+  public static void FocusRenderWidget(IntPtr parent) {
+    IntPtr rw = FindRenderWidget(parent);
+    if (rw == IntPtr.Zero || rw == parent) return;
+    int dummy = 0;
+    uint rwTid = GetWindowThreadProcessId(rw, ref dummy);
+    uint myTid = GetCurrentThreadId();
+    if (rwTid != 0 && rwTid != myTid) {
+      AttachThreadInput(myTid, rwTid, true);
+      SetFocus(rw);
+      AttachThreadInput(myTid, rwTid, false);
+    }
+  }
+
+  [StructLayout(LayoutKind.Sequential)]
+  public struct RECT { public int Left, Top, Right, Bottom; }
+  [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, ref RECT r);
+
+  // Click near the bottom-center using PostMessage — no cursor movement.
+  public static void ClickWindow(IntPtr h) {
+    if (h == IntPtr.Zero) return;
+    IntPtr rw = FindRenderWidget(h);
+    IntPtr target = (rw != IntPtr.Zero) ? rw : h;
+    RECT r = new RECT();
+    if (!GetClientRect(target, ref r)) return;
+    int cx = (r.Left + r.Right) / 2;
+    int cy = r.Top + (int)((r.Bottom - r.Top) * 0.92);
+    IntPtr lp = (IntPtr)(((cy & 0xFFFF) << 16) | (cx & 0xFFFF));
+    PostMessage(target, 0x0201, (IntPtr)1, lp); // WM_LBUTTONDOWN
+    System.Threading.Thread.Sleep(20);
+    PostMessage(target, 0x0202, (IntPtr)0, lp); // WM_LBUTTONUP
+  }
 }
 "@
-
 Add-Type -AssemblyName System.Windows.Forms
 
-$folderName = "${folderName}"
-
-# Strategy:
-# 1. If folderName given, find an Electron/VS Code window whose title contains it (not "Claude")
-# 2. Fall back to Claude Desktop, then mintty
 $target = [IntPtr]::Zero
+$log = @()
+Add-Content $dbg "[$(Get-Date -f o)] PS-START editor=$editor folder=$folderName"
 
-$dbg = "$env:APPDATA\\clawd-on-desk\\clawd-ps-debug.log"
-
-if ($folderName -ne "") {
-  $target = [WinSend]::FindWindowByTitle($folderName)
-  Add-Content $dbg "[$(Get-Date -f o)] folderName=$folderName FindWindowByTitle=$target"
+# ── Pass 1: Editor-based routing (exact, no ambiguity) ──────────────────────
+if ($editor -ne "") {
+  switch ($editor) {
+    "antigravity" {
+      $procs = Get-Process -Name antigravity -EA 0 | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero }
+      $match = if ($folderName -ne "") { $procs | Where-Object { $_.MainWindowTitle -like "*$folderName*" } | Select-Object -First 1 } else { $null }
+      if (-not $match) { $match = $procs | Select-Object -First 1 }
+      if ($match) { $target = $match.MainWindowHandle }
+      $log += "ag=$target"
+    }
+    "obsidian" {
+      $match = Get-Process -Name obsidian -EA 0 | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } | Select-Object -First 1
+      if ($match) { $target = $match.MainWindowHandle }
+      $log += "ob=$target"
+    }
+    "claude" {
+      $target = [WinSend]::FindClaudeDesktop()
+      $log += "claude=$target"
+    }
+    "cmd" {
+      if ($terminalPid -gt 0) {
+        $p = Get-Process -Id $terminalPid -EA 0
+        if ($p -and $p.MainWindowHandle -ne [IntPtr]::Zero) { $target = $p.MainWindowHandle }
+      }
+      if ($target -eq [IntPtr]::Zero) {
+        $p = Get-Process -Name powershell -EA 0 | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } | Select-Object -First 1
+        if ($p) { $target = $p.MainWindowHandle }
+      }
+      if ($target -eq [IntPtr]::Zero) {
+        $p = Get-Process -Name cmd -EA 0 | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } | Select-Object -First 1
+        if ($p) { $target = $p.MainWindowHandle }
+      }
+      $log += "psh=$target"
+    }
+  }
 }
 
+# ── Pass 2: Title-search fallback (original behaviour) ──────────────────────
 if ($target -eq [IntPtr]::Zero) {
-  $cdHwnd = [WinSend]::FindClaudeDesktop()
-  $target  = if ($cdHwnd -ne [IntPtr]::Zero) { $cdHwnd } else { [WinSend]::FindMintty() }
-  Add-Content $dbg "[$(Get-Date -f o)] fallback cdHwnd=$cdHwnd target=$target"
+  if ($folderName -ne "") {
+    $target = [WinSend]::FindWindowByTitle($folderName)
+    $log += "title($folderName)=$target"
+  }
+  if ($target -eq [IntPtr]::Zero) {
+    $target = [WinSend]::FindClaudeDesktop()
+    $log += "cd-fallback=$target"
+  }
 }
 
-Add-Content $dbg "[$(Get-Date -f o)] final target=$target"
+Add-Content $dbg "[$(Get-Date -f o)] $($log -join ' | ') => $target"
+
 [System.Windows.Forms.Clipboard]::SetText($text)
 if ($target -ne [IntPtr]::Zero) {
   [WinSend]::FocusWindow($target)
-  Start-Sleep -Milliseconds 350
+  # For Electron/Chrome apps, also move focus into the render widget (terminal pane)
+  if ($editor -eq "antigravity" -or $editor -eq "obsidian") {
+    Start-Sleep -Milliseconds 150
+    [WinSend]::FocusRenderWidget($target)
+  }
+  # Click near the bottom of the window — only for Claude Desktop
+  if ($editor -eq "claude") { [WinSend]::ClickWindow($target) }
+  Start-Sleep -Milliseconds 675
 }
-[System.Windows.Forms.SendKeys]::SendWait("^v{ENTER}")
+# Paste using the correct shortcut for each app type:
+#   Obsidian terminal plugin: Ctrl+Shift+V  (xterm.js default)
+#   PowerShell console:       Shift+Insert  (universal Windows console paste)
+#   Everything else:          Ctrl+V
+if ($editor -eq "cmd") {
+  [System.Windows.Forms.SendKeys]::SendWait("^+v{ENTER}")
+} else {
+  [System.Windows.Forms.SendKeys]::SendWait("^v{ENTER}")
+}
 `;
+    // Grant PS process permission to steal foreground focus
+    if (ctx.allowAnyForeground) ctx.allowAnyForeground();
+    const _psLogPath = require("path").join(require("os").homedir(), "AppData", "Roaming", "clawd-on-desk", "clawd-chat-debug.log");
     execFile("powershell", ["-NoProfile", "-NonInteractive", "-Command", ps],
       { windowsHide: true },
       (err, stdout, stderr) => {
+        const result = `exitCode=${err ? (err.code || 1) : 0} stderr=${(stderr||"").trim().slice(0,200)} stdout=${(stdout||"").trim().slice(0,100)}`;
+        try { require("fs").appendFileSync(_psLogPath, `[${new Date().toISOString()}] PS-RESULT: ${result}\n`); } catch {}
         if (err) console.error("Clawd chat send error:", stderr || err.message);
       }
     );

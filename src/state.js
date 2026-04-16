@@ -539,9 +539,15 @@ function cleanStaleSessions() {
           s.state = "idle"; s.displayHint = null; changed = true;
         }
       } else if (!s.pidReachable) {
-        debugSession(`stale-delete unreachable ${describeSession(id, s)}`);
-        if (!s.headless) removedNonHeadless = true;
-        sessions.delete(id); changed = true;
+        // Preseeded sessions (disk scan on startup) have pidReachable=false and no sourcePid.
+        // Keep them until they're replaced by a real hook event (they get pidReachable=true).
+        if (s.preseeded) {
+          debugSession(`stale-keep preseeded ${describeSession(id, s)}`);
+        } else {
+          debugSession(`stale-delete unreachable ${describeSession(id, s)}`);
+          if (!s.headless) removedNonHeadless = true;
+          sessions.delete(id); changed = true;
+        }
       } else {
         debugSession(`stale-delete no-source ${describeSession(id, s)}`);
         if (!s.headless) removedNonHeadless = true;

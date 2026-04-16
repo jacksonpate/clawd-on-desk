@@ -281,9 +281,15 @@ function startHttpServer() {
             res.end();
             return;
           }
-          // Session pin filter: if user has pinned specific sessions, drop events from others
+          // Always touch the session so it appears in the Sessions UI even when not pinned.
+          // This is a silent Map update — no setState, no visual change.
           const sid0 = session_id || "default";
-          if (typeof ctx.isSessionAllowed === "function" && !ctx.isSessionAllowed(sid0)) {
+          if (typeof ctx.touchSession === "function" && event !== "SessionEnd") {
+            ctx.touchSession(sid0, state, source_pid, cwd, editor, agentId, agentPid, pidChain);
+          }
+
+          // Session pin filter: if user has pinned specific sessions, drop events from others.
+          if (typeof ctx.isSessionAllowed === "function" && !ctx.isSessionAllowed(sid0, event)) {
             res.writeHead(204, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
             res.end();
             return;
@@ -585,15 +591,11 @@ function startHttpServer() {
         if (tooLarge) { res.writeHead(413); res.end(); return; }
         try {
           const { response_text, session_id: resp_sid } = JSON.parse(body);
-          // Session pin filter
-          const _respAllowed = typeof ctx.isSessionAllowed !== "function" || ctx.isSessionAllowed(resp_sid || "default");
-          try { require("fs").appendFileSync(require("path").join(require("os").homedir(), "AppData", "Roaming", "clawd-on-desk", "clawd-session-filter.log"), `[${new Date().toISOString()}] /response sid=${resp_sid} allowed=${_respAllowed}\n`); } catch {}
-          if (!_respAllowed) {
-            res.writeHead(204, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
-            res.end();
-            return;
-          }
-          if (typeof response_text === "string" && response_text.trim() &&
+          // Response bubble respects session pin filter — only show responses from pinned sessions
+          const respAllowed = typeof ctx.isSessionAllowed === "function"
+            ? ctx.isSessionAllowed(resp_sid || "default")
+            : true;
+          if (respAllowed && typeof response_text === "string" && response_text.trim() &&
               typeof ctx.showResponse === "function") {
             ctx.showResponse(response_text.trim());
           }
