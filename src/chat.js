@@ -367,8 +367,8 @@ Add-Content $dbg "[$(Get-Date -f o)] $($log -join ' | ') => $target"
 [System.Windows.Forms.Clipboard]::SetText($text)
 $wasMinimized = $false
 if ($target -ne [IntPtr]::Zero) {
-  # Flash mode: if PSH or Obsidian was minimized, remember so we can re-minimize after paste
-  if (($editor -eq "cmd" -or $editor -eq "obsidian") -and [WinSend]::IsIconic($target)) {
+  # Flash mode: if window was minimized, restore → paste → re-minimize for all editors
+  if ([WinSend]::IsIconic($target)) {
     $wasMinimized = $true
   }
   [WinSend]::FocusWindow($target)
@@ -402,7 +402,7 @@ if ($editor -eq "cmd") {
 }
 # Flash: re-minimize if it was minimized before we restored it
 if ($wasMinimized) {
-  if ($editor -eq "obsidian") { Start-Sleep -Milliseconds 275 } else { Start-Sleep -Milliseconds 275 }
+  Start-Sleep -Milliseconds 275
   [WinSend]::ShowWindow($target, 6)
 }
 `;
