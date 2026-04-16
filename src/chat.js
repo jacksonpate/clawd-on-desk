@@ -352,7 +352,7 @@ if ($target -ne [IntPtr]::Zero) {
     Start-Sleep -Milliseconds 100
     [WinSend]::ClickWindowNearRight($target)
   }
-  Start-Sleep -Milliseconds 675
+  Start-Sleep -Milliseconds 275
 }
 # Paste using the correct shortcut for each app type
 if ($editor -eq "cmd") {
@@ -362,7 +362,7 @@ if ($editor -eq "cmd") {
 }
 # Flash: re-minimize if it was minimized before we restored it
 if ($wasMinimized) {
-  if ($editor -eq "obsidian") { Start-Sleep -Milliseconds 1000 } else { Start-Sleep -Milliseconds 300 }
+  if ($editor -eq "obsidian") { Start-Sleep -Milliseconds 275 } else { Start-Sleep -Milliseconds 275 }
   [WinSend]::ShowWindow($target, 6)
 }
 `;
