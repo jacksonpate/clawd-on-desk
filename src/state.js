@@ -197,6 +197,13 @@ function applyState(state, svgOverride) {
     return;
   }
 
+  // Global 5-second throttle on all oneshot animations — catches every path
+  if (ONESHOT_STATES.has(state) || ONESHOT_STATES.has(state.replace("mini-alert", "notification").replace("mini-happy", "attention"))) {
+    const now = Date.now();
+    if (now - lastNotificationAt < 3500) return;
+    lastNotificationAt = now;
+  }
+
   if (ctx.miniTransitioning && !state.startsWith("mini-")) {
     return;
   }
@@ -382,11 +389,7 @@ function updateSession(sessionId, state, event, sourcePid, cwd, editor, pidChain
   }
 
   if (event === "PermissionRequest") {
-    const now = Date.now();
-    if (now - lastNotificationAt > 5000) {
-      lastNotificationAt = now;
-      setState("notification");
-    }
+    setState("notification");
     return;
   }
 
@@ -507,11 +510,7 @@ function updateSession(sessionId, state, event, sourcePid, cwd, editor, pidChain
   cleanStaleSessions();
 
   if (ONESHOT_STATES.has(state)) {
-    const now = Date.now();
-    if (now - lastNotificationAt > 5000) {
-      lastNotificationAt = now;
-      setState(state);
-    }
+    setState(state);
     return;
   }
 
@@ -650,14 +649,18 @@ function stopStaleCleanup() {
 }
 
 function resolveDisplayState() {
+  const pins = ctx.pinnedSessionIds;
+  const hasPins = pins && pins.size > 0;
   let best;
   if (sessions.size === 0) {
     best = "idle";
   } else {
     best = "sleeping";
     let hasNonHeadless = false;
-    for (const [, s] of sessions) {
+    for (const [id, s] of sessions) {
       if (s.headless) continue;
+      // Only animate the pinned session — ignore all others when a pin is active
+      if (hasPins && !pins.has(id)) continue;
       hasNonHeadless = true;
       if ((STATE_PRIORITY[s.state] || 0) > (STATE_PRIORITY[best] || 0)) best = s.state;
     }

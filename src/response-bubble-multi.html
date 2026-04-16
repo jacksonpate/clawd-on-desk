@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    background: transparent;
+    overflow: visible;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+
+  /* Wrapper so tail SVG can overflow without clipping */
+  #wrapper {
+    position: relative;
+    display: inline-block;
+  }
+
+  /* Right-side slots: card is offset right to leave room for tail on the left */
+  #wrapper.right-slot #card {
+    margin-left: 40px;
+  }
+
+  #card {
+    position: relative;
+    width: 180px;
+    background: #1c1c1e;
+    border: 1.5px solid rgba(255,255,255,0.10);
+    border-radius: 14px;
+    padding: 11px 13px 10px;
+    box-shadow: 0 6px 24px rgba(0,0,0,0.55);
+    cursor: default;
+    user-select: none;
+  }
+
+  #header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 6px;
+  }
+
+  #label {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+
+  #x-btn {
+    width: 16px;
+    height: 16px;
+    background: rgba(255,255,255,0.07);
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    color: rgba(255,255,255,0.4);
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  #x-btn:hover { background: rgba(255,255,255,0.14); }
+
+  #text {
+    font-size: 12px;
+    color: rgba(255,255,255,0.75);
+    line-height: 1.5;
+  }
+
+  #footer {
+    margin-top: 8px;
+    font-size: 9px;
+    color: rgba(255,255,255,0.20);
+  }
+
+  #timer-bar {
+    height: 2px;
+    background: rgba(255,255,255,0.08);
+    border-radius: 99px;
+    margin-top: 8px;
+    overflow: hidden;
+  }
+
+  #timer-fill {
+    height: 100%;
+    border-radius: 99px;
+    width: 100%;
+    transform-origin: left center;
+  }
+
+  @keyframes shrink {
+    from { transform: scaleX(1); }
+    to   { transform: scaleX(0); }
+  }
+</style>
+</head>
+<body>
+
+<div id="wrapper">
+  <div id="card">
+    <div id="header">
+      <div id="label"></div>
+      <div id="x-btn">×</div>
+    </div>
+    <div id="text"></div>
+    <div id="footer">Shift+click or × to dismiss</div>
+    <div id="timer-bar"><div id="timer-fill"></div></div>
+  </div>
+</div>
+
+<script>
+const TAILS = {
+  tl: `<svg width="46" height="44" style="position:absolute;right:-46px;bottom:15px;overflow:visible;pointer-events:none"><path d="M0,37 C10,35 24,37 36,57 C36,47 10,6 0,6 Z" fill="#1c1c1e" stroke="rgba(255,255,255,0.10)" stroke-width="1.5"/></svg>`,
+  tr: `<svg width="46" height="44" style="position:absolute;left:-40px;bottom:15px;overflow:visible;pointer-events:none"><path d="M40,37 C30,35 16,37 4,57 C4,47 30,6 40,6 Z" fill="#1c1c1e" stroke="rgba(255,255,255,0.10)" stroke-width="1.5"/></svg>`,
+  bl: `<svg width="57" height="55" style="position:absolute;right:-57px;top:17px;overflow:visible;pointer-events:none"><path d="M0,1.75 C10,3.75 24,1.75 36,-14 C36,-4 10,29 0,29 Z" fill="#1c1c1e" stroke="rgba(255,255,255,0.10)" stroke-width="1.5"/></svg>`,
+  br: `<svg width="57" height="55" style="position:absolute;left:-40px;top:17px;overflow:visible;pointer-events:none"><path d="M40,1.75 C30,3.75 16,1.75 4,-14 C4,-4 30,29 40,29 Z" fill="#1c1c1e" stroke="rgba(255,255,255,0.10)" stroke-width="1.5"/></svg>`,
+};
+
+const wrapper  = document.getElementById("wrapper");
+const card     = document.getElementById("card");
+const header   = document.getElementById("header");
+const labelEl  = document.getElementById("label");
+const xBtn     = document.getElementById("x-btn");
+const textEl   = document.getElementById("text");
+const timerFill = document.getElementById("timer-fill");
+
+let currentSlot = null;
+
+window.bubbleAPI.onInit(({ text, label, color, slot, timerMs }) => {
+  currentSlot = slot;
+
+  // Right-side slots: wrapper offset so tail (on left) fits in window
+  if (slot === "tr" || slot === "br") {
+    wrapper.classList.add("right-slot");
+  }
+
+  // Inject tail into card
+  card.insertAdjacentHTML("beforeend", TAILS[slot] || "");
+
+  // Header order: right slots get × first (inside), name last (outside)
+  if (slot === "tr" || slot === "br") {
+    header.insertBefore(xBtn, labelEl);
+  }
+
+  // Label
+  labelEl.textContent = label;
+  labelEl.style.color = color;
+
+  // Message
+  textEl.textContent = text;
+
+  // Timer bar — set full animation string so it starts exactly when bubble-init fires
+  timerFill.style.background = color;
+  timerFill.style.animation = `shrink ${timerMs}ms linear forwards`;
+
+  // Notify main of actual height after render
+  requestAnimationFrame(() => {
+    window.bubbleAPI.resize(slot, card.offsetHeight);
+  });
+});
+
+// Dismiss handlers
+xBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (currentSlot) window.bubbleAPI.dismiss(currentSlot);
+});
+
+document.addEventListener("click", (e) => {
+  if (e.shiftKey && currentSlot) window.bubbleAPI.dismiss(currentSlot);
+});
+
+// Resize on content change
+const ro = new ResizeObserver(() => {
+  if (currentSlot) window.bubbleAPI.resize(currentSlot, card.offsetHeight);
+});
+ro.observe(card);
+</script>
+</body>
+</html>

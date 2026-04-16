@@ -247,6 +247,21 @@ public class WinSend {
   [StructLayout(LayoutKind.Sequential)]
   public struct RECT { public int Left, Top, Right, Bottom; }
   [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, ref RECT r);
+  [DllImport("user32.dll")] public static extern bool ScreenToClient(IntPtr h, ref POINT p);
+  public struct POINT { public int X; public int Y; }
+
+  // Ghost-click at absolute screen coordinates — converts to client coords, uses PostMessage, no cursor movement.
+  public static void GhostClickAbsolute(IntPtr h, int screenX, int screenY) {
+    if (h == IntPtr.Zero) return;
+    IntPtr rw = FindRenderWidget(h);
+    IntPtr target = (rw != IntPtr.Zero) ? rw : h;
+    POINT pt = new POINT { X = screenX, Y = screenY };
+    ScreenToClient(target, ref pt);
+    IntPtr lp = (IntPtr)(((pt.Y & 0xFFFF) << 16) | (pt.X & 0xFFFF));
+    PostMessage(target, 0x0201, (IntPtr)1, lp); // WM_LBUTTONDOWN
+    System.Threading.Thread.Sleep(20);
+    PostMessage(target, 0x0202, (IntPtr)0, lp); // WM_LBUTTONUP
+  }
 
   // Click near the bottom-center using PostMessage — no cursor movement.
   public static void ClickWindow(IntPtr h) {
@@ -261,6 +276,21 @@ public class WinSend {
     PostMessage(target, 0x0201, (IntPtr)1, lp); // WM_LBUTTONDOWN
     System.Threading.Thread.Sleep(20);
     PostMessage(target, 0x0202, (IntPtr)0, lp); // WM_LBUTTONUP
+  }
+
+  // Ghost-click at relative percentages within the window — no cursor movement.
+  public static void GhostClickRelative(IntPtr h, double pctX, double pctY) {
+    if (h == IntPtr.Zero) return;
+    IntPtr rw = FindRenderWidget(h);
+    IntPtr target = (rw != IntPtr.Zero) ? rw : h;
+    RECT r = new RECT();
+    if (!GetClientRect(target, ref r)) return;
+    int cx = r.Left + (int)((r.Right  - r.Left) * pctX);
+    int cy = r.Top  + (int)((r.Bottom - r.Top)  * pctY);
+    IntPtr lp = (IntPtr)(((cy & 0xFFFF) << 16) | (cx & 0xFFFF));
+    PostMessage(target, 0x0201, (IntPtr)1, lp);
+    System.Threading.Thread.Sleep(20);
+    PostMessage(target, 0x0202, (IntPtr)0, lp);
   }
 
   // Click ~10px from the right edge of the MAIN window, vertically centered — no cursor movement.
@@ -284,7 +314,7 @@ public class WinSend {
     RECT r = new RECT();
     if (!GetClientRect(h, ref r)) return;
     double pct = IsZoomed(h) ? 0.92 : 0.88;
-    int cx = (r.Left + r.Right) / 2;
+    int cx = r.Left + (int)((r.Right - r.Left) * 0.25);
     int cy = r.Top + (int)((r.Bottom - r.Top) * pct);
     IntPtr lp = (IntPtr)(((cy & 0xFFFF) << 16) | (cx & 0xFFFF));
     PostMessage(h, 0x0201, (IntPtr)1, lp); // WM_LBUTTONDOWN
@@ -382,15 +412,15 @@ if ($target -ne [IntPtr]::Zero) {
     Start-Sleep -Milliseconds 100
     [WinSend]::ClickWindowBottom85($target)
   }
-  # Obsidian: ghost-click at 93% right to ensure terminal pane is active
+  # Obsidian: ghost-click at 92.7% from left, 87.1% down (terminal pane)
   if ($editor -eq "obsidian") {
     Start-Sleep -Milliseconds 100
-    [WinSend]::ClickWindowNearRight($target)
+    [WinSend]::GhostClickRelative($target, 0.927, 0.871)
   }
-  # Claude Desktop: ghost-click at 93% down (chat input area)
+  # Claude Desktop: ghost-click at 21.8% from left, 92.3% down (chat input area)
   if ($editor -eq "claude") {
     Start-Sleep -Milliseconds 100
-    [WinSend]::ClickWindowBottom($target)
+    [WinSend]::GhostClickRelative($target, 0.218, 0.923)
   }
   Start-Sleep -Milliseconds 275
 }

@@ -593,6 +593,7 @@ const _stateCtx = {
     const entry = (stateMap && stateMap[stateKey]) || (themeMap && themeMap[stateKey]);
     return !!(entry && entry.disabled === true);
   },
+  get pinnedSessionIds() { return pinnedSessionIds; },
   hasAnyEnabledAgent: () => {
     // `get("agents")` returns the live reference (no clone) — we're only
     // reading. Missing agents field falls back to "assume enabled" (the
@@ -703,9 +704,11 @@ const _chatCtx = {
 };
 const _chat = require("./chat")(_chatCtx);
 
-// ── Response bubble ──
-const _response = require("./response")({
-  get win() { return win; },
+// ── Response bubble (multi-slot) ──
+const _responseMulti = require("./response-multi")({
+  get win()          { return win; },
+  get sessions()     { return sessions; },
+  get sessionNames() { return sessionNames; },
   getNearestWorkArea: (x, y) => getNearestWorkArea(x, y),
 });
 
@@ -897,7 +900,7 @@ const _serverCtx = {
   showPermissionBubble,
   replyOpencodePermission,
   permLog,
-  showResponse: (text) => _response.show(text),
+  showResponse: (text, sid) => _responseMulti.show(text, sid),
   isSessionAllowed: (sessionId, event) => {
     // Always let SessionStart through so every session registers in the Map
     // (makes them visible in the UI / available to pin). State changes from
@@ -2363,7 +2366,7 @@ function createWindow() {
       if (bubbleFollowPet) repositionFloatingBubbles();
       else repositionUpdateBubble();
       if (_chat && _chat.reposition) _chat.reposition();
-      if (_response && _response.reposition) _response.reposition();
+      if (_responseMulti && _responseMulti.reposition) _responseMulti.reposition();
     };
     win.on("move", syncFloatingWindows);
     win.on("resize", syncFloatingWindows);
@@ -2419,7 +2422,7 @@ function createWindow() {
   });
 
   _chat.registerIpc();
-  _response.registerIpc();
+  // _response.registerIpc(); — replaced by _responseMulti (no registerIpc needed)
   _sessionPicker.registerIpc();
 
   ipcMain.on("move-window-by", (event, dx, dy) => {
@@ -2678,7 +2681,7 @@ function activateTheme(themeId, variantId) {
   _tick.cleanup();
   _follower.stop();
   _chat.cleanup();
-  _response.cleanup();
+  _responseMulti.cleanup();
   _sessionPicker.cleanup();
   _mini.cleanup();
   // ⚠️ Don't clear pendingPermissions — bubbles are independent BrowserWindows

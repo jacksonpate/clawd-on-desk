@@ -597,7 +597,7 @@ function startHttpServer() {
             : true;
           if (respAllowed && typeof response_text === "string" && response_text.trim() &&
               typeof ctx.showResponse === "function") {
-            ctx.showResponse(response_text.trim());
+            ctx.showResponse(response_text.trim(), resp_sid);
           }
           res.writeHead(200, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
           res.end("ok");
