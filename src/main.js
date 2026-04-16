@@ -690,6 +690,7 @@ const _chatCtx = {
   get pinnedSessionIds() { return pinnedSessionIds; },
   get pinnedSessionCwds() { return pinnedSessionCwds; },
   get selectedSessionIds() { return selectedSessionIds; },
+  get sessionNames() { return sessionNames; },
   getNearestWorkArea: (x, y) => getNearestWorkArea(x, y),
   focusTerminalWindow: (...args) => focusTerminalWindow(...args),
   freezeFollower:  () => _follower.freeze(),

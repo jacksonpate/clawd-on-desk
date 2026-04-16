@@ -14,6 +14,14 @@ const WIN_TOPMOST_LEVEL = "screen-saver";
 const BUBBLE_W = 340;
 const BUBBLE_H = 160;
 
+const EDITOR_COLOR = {
+  claude:      "#fb923c",
+  cmd:         "#2dd4bf",
+  obsidian:    "#a78bfa",
+  antigravity: "#34d399",
+};
+const DEFAULT_COLOR = "#6b7280";
+
 module.exports = function initChat(ctx) {
 
 let chatWin      = null;
@@ -28,15 +36,15 @@ function getPosition() {
   const wa      = ctx.getNearestWorkArea(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
   const margin  = 8;
 
-  // Try to place bubble to the left of Clawd, else right, else above
+  // Try left of Clawd, then right, then clamp inside work area
   let x = bounds.x - BUBBLE_W - margin;
   if (x < wa.x) x = bounds.x + bounds.width + margin;
-  if (x + BUBBLE_W > wa.x + wa.width) x = Math.max(wa.x, bounds.x - BUBBLE_W - margin);
+  // Hard clamp to work area so it never escapes the monitor
+  x = Math.max(wa.x, Math.min(x, wa.x + wa.width - BUBBLE_W));
 
   let y = bounds.y;
-  // Clamp vertically
-  if (y + measuredH > wa.y + wa.height) y = wa.y + wa.height - measuredH - margin;
-  if (y < wa.y) y = wa.y + margin;
+  // Hard clamp vertically
+  y = Math.max(wa.y + margin, Math.min(y, wa.y + wa.height - measuredH - margin));
 
   return { x: Math.round(x), y: Math.round(y) };
 }
@@ -49,8 +57,8 @@ function reposition() {
 }
 
 // Commands that control Clawd directly — intercepted before sending to Claude Code
-const FREEZE_CMDS   = /^(be still|stay|stay still|freeze|stop moving|don'?t move)\.?$/i;
-const UNFREEZE_CMDS = /^(you'?re? (good|free)|move|go|unfreeze|you can move( now)?|start moving)\.?$/i;
+const FREEZE_CMDS   = /^(be still|stay|stay still|freeze|stop moving|don'?t move)[.,!?]*$/i;
+const UNFREEZE_CMDS = /^(you'?re? (good|free)|move|go|unfreeze|you can move( now)?|start moving)[.,!?]*$/i;
 
 function sendMessage(msg) {
   if (!msg) return;
@@ -184,7 +192,8 @@ public class WinSend {
       if (!IsWindowVisible(h) && !IsIconic(h)) return true;
       var cls = new StringBuilder(256); GetClassName(h, cls, 256);
       var ttl = new StringBuilder(256); GetWindowText(h, ttl, 256);
-      if (cls.ToString() == "Chrome_WidgetWin_1" && ttl.ToString() == "Claude") { found = h; return false; }
+      string t = ttl.ToString();
+      if (cls.ToString() == "Chrome_WidgetWin_1" && (t == "Claude" || t.EndsWith("— Claude") || t.EndsWith("- Claude"))) { found = h; return false; }
       return true;
     }, IntPtr.Zero);
     return found;
@@ -420,7 +429,7 @@ if ($target -ne [IntPtr]::Zero) {
   # Claude Desktop: ghost-click at 21.8% from left, 92.3% down (chat input area)
   if ($editor -eq "claude") {
     Start-Sleep -Milliseconds 100
-    [WinSend]::GhostClickRelative($target, 0.218, 0.923)
+    [WinSend]::GhostClickRelative($target, 0.340, 0.930)
   }
   Start-Sleep -Milliseconds 275
 }
@@ -467,10 +476,30 @@ if ($wasMinimized) {
   }
 }
 
+function getSessionInfo() {
+  const pinned  = ctx.pinnedSessionIds;
+  const hasPins = pinned && pinned.size > 0;
+  let sid = null, editor = "";
+  let latest = 0;
+  if (ctx.sessions) {
+    for (const [id, s] of ctx.sessions) {
+      if (hasPins && !pinned.has(id)) continue;
+      if ((s.updatedAt || 0) >= latest) {
+        latest = s.updatedAt || 0;
+        sid    = id;
+        editor = s.editor || "";
+      }
+    }
+  }
+  const name  = (sid && ctx.sessionNames && ctx.sessionNames[sid]) || "Clawd";
+  const color = EDITOR_COLOR[editor] || DEFAULT_COLOR;
+  return { name, color };
+}
+
 function show() {
   if (chatWin && !chatWin.isDestroyed()) {
     reposition();
-    chatWin.webContents.send("chat-show", {});
+    chatWin.webContents.send("chat-show", getSessionInfo());
     return;
   }
 
@@ -501,7 +530,7 @@ function show() {
   chatWin.loadFile(path.join(__dirname, "chat-bubble.html"));
 
   chatWin.webContents.once("did-finish-load", () => {
-    chatWin.webContents.send("chat-show", {});
+    chatWin.webContents.send("chat-show", getSessionInfo());
     reposition();
     chatWin.show();
     chatWin.focus();
