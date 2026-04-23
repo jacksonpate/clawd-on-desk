@@ -11,8 +11,8 @@ const isWin   = process.platform === "win32";
 const LINUX_WINDOW_TYPE = "toolbar";
 const WIN_TOPMOST_LEVEL = "screen-saver";
 
-const BUBBLE_W = 340;
-const BUBBLE_H = 160;
+const BUBBLE_W = 337;
+const BUBBLE_H = 214;
 const MARGIN   = 10;
 
 const EDITOR_COLOR = {
@@ -33,7 +33,9 @@ module.exports = function initChat(ctx) {
 const chatWins      = new Map(); // terminalId → BrowserWindow
 const winHeight     = new Map(); // terminalId → measured height (px)
 const userDragged   = new Set(); // terminals the user has manually moved
+const userResized   = new Set(); // terminals the user has manually resized — stops auto-height
 const progMove      = new Set(); // terminals currently being moved by code (not user)
+const progResize    = new Set(); // terminals currently being resized by code (not user)
 const messageLogs   = new Map(); // terminalId → Array<{role,text}> — persists across bubble open/close
 const snapTimers    = new Map(); // terminalId → debounce handle for snap-back check
 const MAX_LOG       = 100;       // max messages to keep per terminal
@@ -131,34 +133,54 @@ function getLog(terminalId) {
 const SNAP_RADIUS_H = 175;  // px — left/right terminals
 const SNAP_RADIUS_V = 120;  // px — top/bottom terminals (rectangle proportions)
 
+// Freeze the pet only while at least one OPEN chat is still anchored (attached
+// to his body). If every open chat has been dragged away, let him walk again.
+function updateFollowerFreeze() {
+  if (manuallyFrozen) return;
+  let anyAnchored = false;
+  for (const [tid, win] of chatWins) {
+    if (!win || win.isDestroyed()) continue;
+    if (!userDragged.has(tid)) { anyAnchored = true; break; }
+  }
+  if (anyAnchored) {
+    if (ctx.freezeFollower) ctx.freezeFollower();
+  } else {
+    if (ctx.unfreezeFollower && !suppressUnfreeze) ctx.unfreezeFollower();
+  }
+}
+
 function checkSnapBack(terminalId) {
   if (!userDragged.has(terminalId)) return;
   const win = chatWins.get(terminalId);
   if (!win || win.isDestroyed()) return;
   if (!ctx.win || ctx.win.isDestroyed()) return;
 
-  const pet   = ctx.win.getBounds();
-  const bub   = win.getBounds();
-  const petCx = pet.x + pet.width  / 2;
-  const petCy = pet.y + pet.height / 2;
-  const bubCx = bub.x + bub.width  / 2;
-  const bubCy = bub.y + bub.height / 2;
-  const side   = TERMINAL_SIDE[terminalId];
-  const snapR  = (side === "top" || side === "bottom") ? SNAP_RADIUS_V : SNAP_RADIUS_H;
-  const dist   = Math.hypot(bubCx - petCx, bubCy - petCy);
-  if (dist >= snapR) return;
+  const pet = ctx.win.getBounds();
+  const bub = win.getBounds();
 
-  // Each terminal only snaps from its designated side
-  const onSide =
-    side === "left"   ? bubCx <= petCx :
-    side === "right"  ? bubCx >= petCx :
-    side === "top"    ? bubCy <= petCy :
-    side === "bottom" ? bubCy >= petCy : true;
+  // The pet window has transparent padding around the sprite. Shrink its bounds
+  // so snap-back only fires when the bubble overlaps the actual body (center ~60%).
+  const insetX = Math.round(pet.width  * 0.22);
+  const insetY = Math.round(pet.height * 0.22);
+  const bodyLeft   = pet.x + insetX;
+  const bodyTop    = pet.y + insetY;
+  const bodyRight  = pet.x + pet.width  - insetX;
+  const bodyBottom = pet.y + pet.height - insetY;
 
-  if (onSide) {
-    userDragged.delete(terminalId);
-    repositionTerminal(terminalId);
-  }
+  const overlaps =
+    bub.x                < bodyRight   &&
+    bub.x + bub.width    > bodyLeft    &&
+    bub.y                < bodyBottom  &&
+    bub.y + bub.height   > bodyTop;
+  if (!overlaps) return;
+
+  // Snap back to anchored state AND reset any manual resize so the bubble
+  // returns to the default size whenever it docks onto the pet.
+  userDragged.delete(terminalId);
+  userResized.delete(terminalId);
+  winHeight.delete(terminalId);
+  repositionTerminal(terminalId);
+  updateFollowerFreeze();
 }
 
 // ── Session info ────────────────────────────────────────────────────────────
@@ -191,31 +213,64 @@ function findTerminalBySender(sender) {
 // ── Window management ───────────────────────────────────────────────────────
 
 function setBoundsTracked(terminalId, win, bounds) {
+  progResize.add(terminalId);
+  setImmediate(() => progResize.delete(terminalId));
   progMove.add(terminalId);
   win.setBounds(bounds);
   // Clear flag after Electron processes the move event (next tick)
   setImmediate(() => progMove.delete(terminalId));
 }
 
+// Full reposition — used when the chat's own height changes (chat-height IPC).
+// Preserves the current window size for anything the user has touched.
 function repositionTerminal(terminalId) {
   const win = chatWins.get(terminalId);
   if (!win || win.isDestroyed()) return;
   const h = (winHeight.get(terminalId) || BUBBLE_H) + 4;
+  const userSized = userResized.has(terminalId);
+  const cur = win.getBounds();
 
   if (userDragged.has(terminalId)) {
-    // User placed this window — only update height, never move x/y
-    const cur = win.getBounds();
+    // User placed this window — preserve position. Preserve size too if user resized.
+    if (userSized) return;
     setBoundsTracked(terminalId, win, { ...cur, height: h });
     return;
   }
 
-  // Still anchored — update position + height
+  if (userSized) {
+    const { x, y } = getPositionForTerminal(terminalId, cur.height - 4);
+    setBoundsTracked(terminalId, win, { x, y, width: cur.width, height: cur.height });
+    return;
+  }
   const { x, y } = getPositionForTerminal(terminalId, h - 4);
   setBoundsTracked(terminalId, win, { x, y, width: BUBBLE_W, height: h });
 }
 
+// Lightweight follow — called when the PET moves. Re-anchors still-attached
+// bubbles to the pet. Also *clamps* size back to the default — attached
+// bubbles can never exceed the original starting size.
 function reposition() {
-  for (const [tid] of chatWins) repositionTerminal(tid);
+  for (const [tid, win] of chatWins) {
+    if (!win || win.isDestroyed()) continue;
+    if (userDragged.has(tid)) continue; // user-placed bubbles don't follow
+    const cur = win.getBounds();
+    const targetW = BUBBLE_W;
+    const targetH = BUBBLE_H + 4;
+    const { x, y } = getPositionForTerminal(tid, targetH - 4);
+    const needsResize = cur.width !== targetW || cur.height !== targetH;
+    const needsMove   = cur.x !== x || cur.y !== y;
+    if (!needsResize && !needsMove) continue;
+    if (needsResize) {
+      progResize.add(tid);
+      progMove.add(tid);
+      win.setBounds({ x: Math.round(x), y: Math.round(y), width: targetW, height: targetH });
+      setImmediate(() => { progResize.delete(tid); progMove.delete(tid); });
+    } else {
+      progMove.add(tid);
+      win.setPosition(Math.round(x), Math.round(y));
+      setImmediate(() => progMove.delete(tid));
+    }
+  }
 }
 
 function showTerminal(terminalId) {
@@ -239,7 +294,9 @@ function showTerminal(terminalId) {
     frame:       false,
     transparent: true,
     alwaysOnTop: true,
-    resizable:   false,
+    resizable:   true,
+    minWidth:    260,
+    minHeight:   160,
     movable:     true,
     skipTaskbar: true,
     hasShadow:   false,
@@ -259,26 +316,41 @@ function showTerminal(terminalId) {
   win.loadFile(path.join(__dirname, "chat-bubble.html"));
 
   win.webContents.once("did-finish-load", () => {
-    win.webContents.send("chat-show", getSessionInfoForTerminal(terminalId));
+    const info = getSessionInfoForTerminal(terminalId);
+    const history = getLog(terminalId);
+    win.webContents.send("chat-show", { ...info, history });
     win.show();
     win.focus();
-    if (chatWins.size === 1 && ctx.freezeFollower) ctx.freezeFollower();
+    updateFollowerFreeze();
   });
 
   // Detect user drag — moved event without our programmatic flag = user dragged it
   win.on("moved", () => {
     if (!progMove.has(terminalId)) {
+      const wasAnchored = !userDragged.has(terminalId);
       userDragged.add(terminalId); // now free-floating, stop anchoring to pet
+      if (wasAnchored) updateFollowerFreeze(); // detached → maybe let pet walk
       // Debounced snap-back check — if bubble released near bot, re-anchor
       clearTimeout(snapTimers.get(terminalId));
       snapTimers.set(terminalId, setTimeout(() => checkSnapBack(terminalId), 400));
     }
   });
 
+  // User resize — flip the userResized flag and stop auto-growing.
+  win.on("resized", () => {
+    if (progResize.has(terminalId)) return;
+    userResized.add(terminalId);
+  });
+
   win.on("closed", () => {
     chatWins.delete(terminalId);
+    winHeight.delete(terminalId);   // reset cached auto-size so next open uses default
     userDragged.delete(terminalId); // next open starts anchored again
+    userResized.delete(terminalId); // next open starts auto-sized again
     progMove.delete(terminalId);
+    progResize.delete(terminalId);
+    // Re-evaluate freeze state after this bubble closes.
+    updateFollowerFreeze();
     if (chatWins.size === 0 && !suppressUnfreeze && !manuallyFrozen && ctx.unfreezeFollower) {
       ctx.unfreezeFollower();
     }
@@ -354,16 +426,27 @@ function sendMessage(msg, terminalId) {
       win.webContents.send("chat-user-message", { text: msg });
       win.webContents.send("chat-thinking", true);
     }
-    tm.sendToTerminal(terminalId, msg, (response, err) => {
-      const responseText = response || ("⚠ " + err);
-      logMessage(terminalId, "claude", responseText);
-      const w = chatWins.get(terminalId);
-      if (w && !w.isDestroyed()) {
-        w.webContents.send("chat-thinking", false);
-        w.webContents.send("chat-message", { text: responseText });
+    tm.sendToTerminal(
+      terminalId,
+      msg,
+      (response, err) => {
+        const responseText = response || ("⚠ " + err);
+        logMessage(terminalId, "claude", responseText);
+        const w = chatWins.get(terminalId);
+        if (w && !w.isDestroyed()) {
+          w.webContents.send("chat-thinking", false);
+          w.webContents.send("chat-message", { text: responseText });
+        }
+        if (ctx.showResponse) ctx.showResponse(responseText, terminalId);
+      },
+      (evt) => {
+        // Live stream events: forward to the chat bubble
+        const w = chatWins.get(terminalId);
+        if (w && !w.isDestroyed()) {
+          w.webContents.send("chat-stream", evt);
+        }
       }
-      if (ctx.showResponse) ctx.showResponse(responseText, terminalId);
-    });
+    );
     return;
   }
 
@@ -423,6 +506,19 @@ function registerIpc() {
     sendMessage(msg, terminalId);
   });
 
+  ipcMain.on("chat-cancel", (event) => {
+    const terminalId = findTerminalBySender(event.sender);
+    if (!terminalId) return;
+    const tm = ctx.terminalManager;
+    if (tm && tm.cancelTerminal) tm.cancelTerminal(terminalId);
+    // Tell the bubble to clear its thinking state
+    const win = chatWins.get(terminalId);
+    if (win && !win.isDestroyed()) {
+      win.webContents.send("chat-thinking", false);
+      win.webContents.send("chat-message", { text: "⏹ Stopped." });
+    }
+  });
+
   ipcMain.on("chat-close", (event) => {
     const terminalId = findTerminalBySender(event.sender);
     if (terminalId) hide(terminalId);
@@ -431,8 +527,79 @@ function registerIpc() {
   ipcMain.on("chat-height", (event, h) => {
     const terminalId = findTerminalBySender(event.sender);
     if (!terminalId) return;
+    // Pinned to the pet → size is LOCKED. No auto-resize of any kind.
+    if (!userDragged.has(terminalId)) return;
+    // Detached but user has manually resized → respect their size.
+    if (userResized.has(terminalId)) return;
+    // Detached + not yet manually resized → allow auto-height to fit content.
     winHeight.set(terminalId, h);
     repositionTerminal(terminalId);
+  });
+
+  // ── Manual corner-grip resize ──
+  const resizeStart = new Map(); // terminalId → { x, y, w, h }
+  ipcMain.on("chat-resize-start", (event) => {
+    const terminalId = findTerminalBySender(event.sender);
+    const win = terminalId && chatWins.get(terminalId);
+    if (!win || win.isDestroyed()) return;
+    const b = win.getBounds();
+    resizeStart.set(terminalId, { x: b.x, y: b.y, w: b.width, h: b.height });
+  });
+  ipcMain.on("chat-resize-delta", (event, { dx, dy, corner }) => {
+    const terminalId = findTerminalBySender(event.sender);
+    const win = terminalId && chatWins.get(terminalId);
+    const s   = terminalId && resizeStart.get(terminalId);
+    if (!win || win.isDestroyed() || !s) return;
+    const minW = 260, minH = 160;
+    let newW, newH, newX = s.x, newY = s.y;
+    if (corner === "br") {
+      newW = Math.max(minW, s.w + dx);
+      newH = Math.max(minH, s.h + dy);
+    } else if (corner === "bl") {
+      newW = Math.max(minW, s.w - dx);
+      newH = Math.max(minH, s.h + dy);
+      newX = s.x + (s.w - newW);
+    } else return;
+    progResize.add(terminalId);
+    win.setBounds({ x: Math.round(newX), y: Math.round(newY), width: Math.round(newW), height: Math.round(newH) });
+    setImmediate(() => progResize.delete(terminalId));
+  });
+  ipcMain.on("chat-resize-end", (event) => {
+    const terminalId = findTerminalBySender(event.sender);
+    if (!terminalId) return;
+    resizeStart.delete(terminalId);
+    userResized.add(terminalId); // lock auto-size off after manual resize
+  });
+
+  // ── Aero-Snap (Win+Arrow) ──
+  const preSnapBounds = new Map(); // terminalId → bounds before snap (for restore)
+  ipcMain.on("chat-snap", (event, where) => {
+    const terminalId = findTerminalBySender(event.sender);
+    const win = terminalId && chatWins.get(terminalId);
+    if (!win || win.isDestroyed()) return;
+    const b = win.getBounds();
+    const wa = ctx.getNearestWorkArea(b.x + b.width / 2, b.y + b.height / 2);
+    let target;
+    if (where === "left") {
+      target = { x: wa.x, y: wa.y, width: Math.floor(wa.width / 2), height: wa.height };
+    } else if (where === "right") {
+      target = { x: wa.x + Math.ceil(wa.width / 2), y: wa.y, width: Math.floor(wa.width / 2), height: wa.height };
+    } else if (where === "max") {
+      target = { x: wa.x, y: wa.y, width: wa.width, height: wa.height };
+    } else if (where === "restore") {
+      target = preSnapBounds.get(terminalId) || null;
+    } else return;
+    if (!target) return;
+    if (where !== "restore" && !preSnapBounds.has(terminalId)) {
+      preSnapBounds.set(terminalId, { ...b });
+    }
+    if (where === "restore") preSnapBounds.delete(terminalId);
+    progResize.add(terminalId);
+    progMove.add(terminalId);
+    win.setBounds(target);
+    setImmediate(() => { progResize.delete(terminalId); progMove.delete(terminalId); });
+    userResized.add(terminalId);
+    userDragged.add(terminalId);
   });
 }
 
@@ -463,6 +630,18 @@ function pushSessionUpdate(terminalId) {
   }
 }
 
-return { show, hide, registerIpc, cleanup, pushSessionUpdate, reposition };
+// Is the chat bubble open for this terminal (or any terminal if no id given)?
+function isOpen(terminalId) {
+  if (terminalId) {
+    const w = chatWins.get(terminalId);
+    return !!(w && !w.isDestroyed() && w.isVisible());
+  }
+  for (const w of chatWins.values()) {
+    if (w && !w.isDestroyed() && w.isVisible()) return true;
+  }
+  return false;
+}
+
+return { show, hide, registerIpc, cleanup, pushSessionUpdate, reposition, isOpen };
 
 };

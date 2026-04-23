@@ -122,7 +122,7 @@
       <div id="x-btn">×</div>
     </div>
     <div id="text"></div>
-    <div id="footer">Shift+click or × to dismiss</div>
+    <div id="footer">Left-click to open · Shift+click to dismiss</div>
     <div id="timer-bar"><div id="timer-fill"></div></div>
   </div>
 </div>
@@ -190,8 +190,16 @@ xBtn.addEventListener("click", (e) => {
 });
 
 document.addEventListener("click", (e) => {
-  if (e.shiftKey && currentSlot) window.bubbleAPI.dismiss(currentSlot);
+  if (!currentSlot) return;
+  if (e.shiftKey) { window.bubbleAPI.dismiss(currentSlot); return; }
+  // Ignore clicks on the × button (it handles itself)
+  if (e.target && e.target.closest && e.target.closest("#xBtn")) return;
+  // Left-click anywhere else on the bubble opens the full chat
+  window.bubbleAPI.open(currentSlot);
 });
+
+// Indicate the bubble is clickable
+card.style.cursor = "pointer";
 
 // Resize on content change
 const ro = new ResizeObserver(() => {

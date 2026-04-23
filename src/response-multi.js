@@ -46,6 +46,7 @@ module.exports = function initResponseMulti(ctx) {
   const timers        = {};  // slotId → setTimeout handle
   const slotHeight    = {};  // slotId → last known height
   const heightReady   = {};  // slotId → true once renderer has confirmed real height
+  const slotSid       = {};  // slotId → session/terminal id (for click-to-open)
   // Shared tip Y per ROW — tl+tr share one value, bl+br share one value.
   // Set by reposition() at rest. Never per-slot so the two can never diverge.
   let topTipY = null;
@@ -77,6 +78,7 @@ module.exports = function initResponseMulti(ctx) {
     const w = wins[slotId];
     delete wins[slotId];
     heightReady[slotId] = false;
+    delete slotSid[slotId];
     if (w && !w.isDestroyed()) w.close();
   }
 
@@ -123,7 +125,8 @@ module.exports = function initResponseMulti(ctx) {
 
     wins[slot.id]         = win;
     slotHeight[slot.id]   = WINDOW_H;
-    heightReady[slot.id]  = false;  // don't let reposition() touch this slot until renderer confirms height
+    heightReady[slot.id]  = false;
+    slotSid[slot.id]      = sid || null;  // don't let reposition() touch this slot until renderer confirms height
     // Seed shared row tipY on first spawn so bubble-resize has something to work with
     if (slot.top  && topTipY == null) topTipY = bounds.y + WINDOW_H;
     if (!slot.top && botTipY == null) botTipY = bounds.y;
@@ -157,6 +160,13 @@ module.exports = function initResponseMulti(ctx) {
 
     ipcMain.on("bubble-dismiss", (_e, { slot }) => {
       if (slot) hide(slot);
+    });
+
+    ipcMain.on("bubble-open", (_e, { slot }) => {
+      if (!slot) return;
+      const sid = slotSid[slot];
+      hide(slot);
+      if (sid && ctx.openChat) ctx.openChat(sid);
     });
 
     ipcMain.on("bubble-resize", (_e, { slot, h }) => {

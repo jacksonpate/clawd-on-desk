@@ -20,13 +20,20 @@
   * { box-sizing: border-box; margin: 0; padding: 0; }
 
   html, body {
-    background: transparent;
+    /* 1% alpha so the whole window registers mouse hits (needed for edge-resize on transparent frameless windows) */
+    background: rgba(0,0,0,0.01);
     overflow: hidden;
+    height: 100%;
+    width:  100%;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     -webkit-font-smoothing: antialiased;
   }
+  body {
+    /* Larger margin around the card leaves a hit-testable edge for resizing */
+    padding: 8px;
+  }
 
-  /* ── Card shell ── */
+  /* ── Card shell — fills the full window so native edge-resize hit zones work ── */
   .card {
     background: var(--card-bg);
     border: 2px solid var(--accent);
@@ -34,7 +41,8 @@
     box-shadow: var(--card-shadow);
     display: flex;
     flex-direction: row;
-    width: 320px;
+    width: 100%;
+    height: 100%;
     opacity: 0;
     transform: translateY(8px) scale(0.96);
     transform-origin: center top;
@@ -65,22 +73,26 @@
     min-width: 0;
   }
 
-  /* ── Header — drag handle ── */
+  /* ── Header — NOT draggable; only the pill is ── */
   .header {
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
     flex-shrink: 0;
-    -webkit-app-region: drag;
-    cursor: grab;
+    -webkit-app-region: no-drag;
   }
-  /* Everything interactive inside the header must opt out of drag */
   .close-btn { -webkit-app-region: no-drag; }
   .session-info {
     display: flex;
     flex-direction: column;
     gap: 4px;
   }
+  /* Only the pill (terminal name chip) is the drag handle */
+  .pill {
+    -webkit-app-region: drag;
+    cursor: grab;
+  }
+  .pill:active { cursor: grabbing; }
   .sending-to {
     font-size: 11px;
     font-weight: 500;
@@ -121,12 +133,13 @@
     -webkit-app-region: no-drag;
   }
 
-  /* ── Message thread ── */
+  /* ── Message thread — fills remaining vertical space ── */
   #messages {
     display: flex;
     flex-direction: column;
     gap: 5px;
-    max-height: 160px;
+    flex: 1 1 auto;
+    min-height: 60px;
     overflow-y: auto;
     overflow-x: hidden;
   }
@@ -160,35 +173,202 @@
     border: 1px solid rgba(255,255,255,0.08);
     border-bottom-left-radius: 3px;
   }
-
-  /* ── Thinking ── */
-  #thinkingEl {
-    display: none;
+  /* ── Streamed tool events (collapsible details) ── */
+  details.msg-tool, details.msg-tool-result {
+    align-self: stretch;
+    width: 100%;
+    font-family: ui-monospace, "JetBrains Mono", Consolas, monospace;
     font-size: 11px;
+    line-height: 1.45;
+    border-radius: 7px;
+    animation: msgPop 0.18s ease;
+    overflow: hidden;
+  }
+  details.msg-tool > summary,
+  details.msg-tool-result > summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 6px 9px;
+    user-select: none;
+    outline: none;
+  }
+  details.msg-tool > summary::-webkit-details-marker,
+  details.msg-tool-result > summary::-webkit-details-marker { display: none; }
+  details.msg-tool > summary::before,
+  details.msg-tool-result > summary::before {
+    content: "▸ ";
+    display: inline-block;
+    transition: transform 0.15s;
+    opacity: 0.6;
+  }
+  details[open].msg-tool > summary::before,
+  details[open].msg-tool-result > summary::before {
+    transform: rotate(90deg);
+  }
+  details.msg-tool > .body,
+  details.msg-tool-result > .body {
+    padding: 0 9px 8px 22px;
+    word-break: break-word;
+    white-space: pre-wrap;
+    max-height: 320px;
+    overflow-y: auto;
+  }
+  details.msg-tool {
+    background: rgba(100, 165, 255, 0.18);
+    border: 1px solid rgba(100, 165, 255, 0.50);
+    border-left: 3px solid #5ea2ff;
+    color: #d6e8ff;
+  }
+  details.msg-tool .tool-name { color: #ffffff; font-weight: 700; }
+  details.msg-tool-result {
+    background: rgba(90, 210, 140, 0.18);
+    border: 1px solid rgba(90, 210, 140, 0.50);
+    border-left: 3px solid #4fd47f;
+    color: #c7f0d4;
+  }
+  details.msg-tool-result.err {
+    background: rgba(255, 110, 110, 0.18);
+    border-color: rgba(255, 110, 110, 0.55);
+    border-left: 3px solid #ff6e6e;
+    color: #ffc8c8;
+  }
+  details.msg-tool > .body,
+  details.msg-tool-result > .body {
+    color: #e5e7eb;
+  }
+  .msg-claude.streaming::after {
+    content: "▊";
+    margin-left: 2px;
+    opacity: 0.6;
+    animation: blink 1s steps(2) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  /* Tiny thinking-cloud chip — small italic grey, never breaks the layout */
+  .msg-thinking {
+    align-self: flex-start;
+    font-size: 9.5px !important;
+    line-height: 1.35;
+    font-style: italic;
+    color: #a1a1aa !important;
+    opacity: 0.85;
+    padding: 2px 6px;
+    max-width: 95%;
+    word-break: break-word;
+    white-space: pre-wrap;
+  }
+
+  /* ── Input wrap — textarea with overlaid buttons + slash suggester ── */
+  .input-wrap {
+    position: relative;
+    flex-shrink: 0;
+    margin-top: 8px;
+  }
+  .thinking-inline {
+    display: none;
+    position: absolute;
+    left: 10px;
+    bottom: 6px;
+    font-size: 10.5px;
     color: #9ca3af;
     font-style: italic;
-    padding-left: 2px;
-    flex-shrink: 0;
+    pointer-events: none;
+  }
+  .thinking-inline.visible { display: block; }
+  .input-actions {
+    position: absolute;
+    right: 8px;
+    bottom: 10px;
+    display: flex;
+    gap: 4px;
+    -webkit-app-region: no-drag;
+  }
+  .icon-btn {
+    width: 26px; height: 26px;
+    border-radius: 7px;
+    border: none;
+    cursor: pointer;
+    font-size: 13px;
+    display: flex; align-items: center; justify-content: center;
+    transition: background 0.15s, transform 0.08s, opacity 0.15s;
+  }
+  .icon-btn:active { transform: scale(0.92); }
+  .icon-btn.send {
+    background: var(--btn-bg);
+    color: #fff;
+  }
+  .icon-btn.send:hover { background: var(--btn-hover); }
+  .icon-btn.send:disabled { opacity: 0.35; cursor: default; }
+  .icon-btn.stop {
+    background: rgba(255, 110, 110, 0.18);
+    color: #ffc8c8;
+    border: 1px solid rgba(255, 110, 110, 0.45);
+    display: none;
+  }
+  .icon-btn.stop:hover { background: rgba(255, 110, 110, 0.32); }
+  /* Thinking state: show stop, hide send */
+  .input-wrap.thinking .icon-btn.stop { display: flex; }
+  .input-wrap.thinking .icon-btn.send { display: none; }
+
+  /* ── Slash command suggester ── */
+  .slash-suggest {
+    display: none;
+    position: absolute;
+    left: 0; right: 0;
+    bottom: calc(100% + 4px);
+    background: #0c0c0e;
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 10px;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.45);
+    max-height: 180px;
+    overflow-y: auto;
+    z-index: 20;
+    padding: 4px;
+  }
+  .slash-suggest.visible { display: block; }
+  .slash-item {
+    padding: 6px 9px;
+    font-size: 12px;
+    color: var(--text-primary);
+    border-radius: 6px;
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    cursor: pointer;
+  }
+  .slash-item .cmd {
+    font-family: ui-monospace, Consolas, monospace;
+    font-weight: 600;
+    color: #eab308;
+  }
+  .slash-item .desc {
+    color: var(--text-sub);
+    font-size: 11px;
+  }
+  .slash-item:hover,
+  .slash-item.active {
+    background: rgba(255,255,255,0.08);
   }
 
   /* ── Textarea ── */
   textarea {
     width: 100%;
-    min-height: 58px;
+    min-height: 44px;
     max-height: 160px;
     resize: none;
     background: var(--input-bg);
     border: 1px solid var(--input-border);
     border-radius: 10px;
-    padding: 9px 11px;
+    padding: 8px 70px 8px 11px; /* right room for stop + send buttons */
     font-size: 13px;
     font-family: inherit;
     color: var(--text-primary);
     outline: none;
-    line-height: 1.5;
+    line-height: 1.45;
     transition: border-color 0.15s;
     overflow-y: auto;
     flex-shrink: 0;
+    box-sizing: border-box;
   }
   textarea:focus { border-color: var(--btn-bg); }
   textarea::placeholder { color: var(--text-sub); }
@@ -210,6 +390,45 @@
   .send-btn:hover  { background: var(--btn-hover); }
   .send-btn:active { transform: scale(0.96); }
   .send-btn:disabled { opacity: 0.45; cursor: default; }
+
+  /* ── Manual resize grips (bottom corners) ── */
+  .resize-grip {
+    position: absolute;
+    width: 18px;
+    height: 18px;
+    bottom: 2px;
+    z-index: 10;
+    -webkit-app-region: no-drag;
+    opacity: 0.55;
+    transition: opacity 0.15s;
+  }
+  .resize-grip:hover { opacity: 1; }
+  .resize-grip.br {
+    right: 2px;
+    cursor: nwse-resize;
+    background:
+      linear-gradient(135deg,
+        transparent 0 10px,
+        rgba(255,255,255,0.5) 10px 11px,
+        transparent 11px 13px,
+        rgba(255,255,255,0.5) 13px 14px,
+        transparent 14px 16px,
+        rgba(255,255,255,0.5) 16px 17px,
+        transparent 17px);
+  }
+  .resize-grip.bl {
+    left: 2px;
+    cursor: nesw-resize;
+    background:
+      linear-gradient(45deg,
+        transparent 0 10px,
+        rgba(255,255,255,0.5) 10px 11px,
+        transparent 11px 13px,
+        rgba(255,255,255,0.5) 13px 14px,
+        transparent 14px 16px,
+        rgba(255,255,255,0.5) 16px 17px,
+        transparent 17px);
+  }
 </style>
 </head>
 <body>
@@ -225,12 +444,17 @@
       </div>
       <button class="close-btn" id="closeBtn" title="Close">×</button>
     </div>
+    <div class="resize-grip br" id="gripBr" title="Drag to resize"></div>
+    <div class="resize-grip bl" id="gripBl" title="Drag to resize"></div>
     <div id="messages"></div>
-    <div id="thinkingEl">Claude is thinking…</div>
-    <textarea id="input" placeholder="Ask anything…" autofocus></textarea>
-    <div class="footer">
-      <span class="hint">↵ send &nbsp;·&nbsp; ⇧↵ newline</span>
-      <button class="send-btn" id="sendBtn">Send</button>
+    <div class="input-wrap">
+      <div id="slashSuggest" class="slash-suggest"></div>
+      <textarea id="input" placeholder="Ask anything…" autofocus></textarea>
+      <span id="thinkingEl" class="thinking-inline">thinking…</span>
+      <div class="input-actions">
+        <button class="icon-btn stop" id="stopBtn" title="Stop">⏹</button>
+        <button class="icon-btn send" id="sendBtn" title="Send">➤</button>
+      </div>
     </div>
   </div>
 </div>
@@ -239,18 +463,32 @@
 const card       = document.getElementById("card");
 const accentBar  = document.getElementById("accentBar");
 const messages   = document.getElementById("messages");
-const thinkingEl = document.getElementById("thinkingEl");
+const thinkingEl  = document.getElementById("thinkingEl");
+const thinkingRow = { classList: { toggle: (_, v) => {
+  inputWrap.classList.toggle("thinking", !!v);
+  thinkingEl.classList.toggle("visible", !!v);
+}, remove: () => {
+  inputWrap.classList.remove("thinking");
+  thinkingEl.classList.remove("visible");
+} } };
+const stopBtn     = document.getElementById("stopBtn");
 const pill       = document.getElementById("sessionPill");
 const dot        = document.getElementById("sessionDot");
 const nameEl     = document.getElementById("sessionName");
 const input      = document.getElementById("input");
 const sendBtn    = document.getElementById("sendBtn");
 const closeBtn   = document.getElementById("closeBtn");
+const inputWrap  = document.querySelector(".input-wrap");
+const slashEl    = document.getElementById("slashSuggest");
 
 let accentColor = "#6b7280";
 
+// Cap auto-growth at ~6 message-bubbles worth of height. After that the user
+// resizes manually (and userResized locks auto-size off entirely).
+const AUTO_HEIGHT_CAP = 460;
 function reportHeight() {
-  window.chatAPI.reportHeight(card.offsetHeight + 4);
+  const h = Math.min(card.offsetHeight + 4, AUTO_HEIGHT_CAP);
+  window.chatAPI.reportHeight(h);
 }
 
 function applySession(data) {
@@ -277,9 +515,18 @@ function addMessage(text, role) {
   reportHeight();
 }
 
-// ── Initial show: animate card in, apply session ──
+// ── Initial show: animate card in, apply session, replay history ──
 window.chatAPI.onShow((data) => {
   applySession(data);
+  // Replay stored history so opening the bubble shows past conversation.
+  messages.innerHTML = "";
+  if (Array.isArray(data && data.history)) {
+    for (const entry of data.history) {
+      const role = entry.role === "user" ? "user" : "claude";
+      addMessage(entry.text || "", role);
+    }
+    messages.scrollTop = messages.scrollHeight;
+  }
   card.classList.add("visible");
   input.focus();
   setTimeout(reportHeight, 50);
@@ -299,7 +546,7 @@ window.chatAPI.onHide(() => {
 // ── Thinking state ──
 if (window.chatAPI.onThinking) {
   window.chatAPI.onThinking((val) => {
-    thinkingEl.style.display = val ? "block" : "none";
+    thinkingRow.classList.toggle("visible", !!val);
     sendBtn.disabled = val;
     reportHeight();
   });
@@ -312,12 +559,117 @@ if (window.chatAPI.onUserMessage) {
   });
 }
 
-// ── Claude response ──
+// ── Streaming state ──
+let streamBubble = null;   // current live .msg-claude element being appended to
+let streamedAny  = false;  // did we stream any text this turn?
+
+function truncate(s, n) {
+  s = String(s == null ? "" : s);
+  return s.length > n ? s.slice(0, n) + "…" : s;
+}
+
+function toolInputSummary(input) {
+  if (!input || typeof input !== "object") return "";
+  // Prefer the most useful fields
+  const pick = input.command || input.file_path || input.path || input.url || input.query || input.pattern || input.description;
+  if (pick) return truncate(pick, 120);
+  try { return truncate(JSON.stringify(input), 120); } catch { return ""; }
+}
+
+function toolResultText(content) {
+  if (content == null) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map(c => (typeof c === "string" ? c : (c && c.text) || "")).join("\n");
+  }
+  try { return JSON.stringify(content); } catch { return ""; }
+}
+
+if (window.chatAPI.onStream) {
+  window.chatAPI.onStream((evt) => {
+    if (!evt) return;
+
+    if (evt.type === "text" && evt.delta) {
+      if (!streamBubble) {
+        streamBubble = document.createElement("div");
+        streamBubble.className = "msg msg-claude streaming";
+        messages.appendChild(streamBubble);
+      }
+      streamBubble.textContent += evt.delta;
+      streamedAny = true;
+      messages.scrollTop = messages.scrollHeight;
+      reportHeight();
+      return;
+    }
+
+    if (evt.type === "tool_use") {
+      // Finalize any active text bubble before a tool block
+      if (streamBubble) { streamBubble.classList.remove("streaming"); streamBubble = null; }
+      const d = document.createElement("details");
+      d.className = "msg-tool";
+      const s = document.createElement("summary");
+      const name = document.createElement("span");
+      name.className = "tool-name";
+      name.textContent = "⚡ " + (evt.name || "tool");
+      s.appendChild(name);
+      const inputStr = toolInputSummary(evt.input);
+      if (inputStr) s.appendChild(document.createTextNode("  " + inputStr));
+      d.appendChild(s);
+      // Full input as body
+      const body = document.createElement("div");
+      body.className = "body";
+      try { body.textContent = JSON.stringify(evt.input, null, 2); } catch { body.textContent = String(evt.input || ""); }
+      d.appendChild(body);
+      messages.appendChild(d);
+      messages.scrollTop = messages.scrollHeight;
+      reportHeight();
+      return;
+    }
+
+    if (evt.type === "tool_result") {
+      const d = document.createElement("details");
+      d.className = "msg-tool-result" + (evt.is_error ? " err" : "");
+      const s = document.createElement("summary");
+      const full = toolResultText(evt.content);
+      const preview = truncate(full.replace(/\s+/g, " "), 120);
+      s.textContent = (evt.is_error ? "⚠ " : "✓ ") + "result  " + preview;
+      d.appendChild(s);
+      const body = document.createElement("div");
+      body.className = "body";
+      body.textContent = full;
+      d.appendChild(body);
+      messages.appendChild(d);
+      messages.scrollTop = messages.scrollHeight;
+      reportHeight();
+      return;
+    }
+
+    if (evt.type === "thinking" && evt.delta) {
+      // Render thinking as a tiny italic grey line (cloud 💭 chip)
+      const el = document.createElement("div");
+      el.className = "msg-thinking";
+      el.textContent = "💭 " + truncate(evt.delta, 280);
+      messages.appendChild(el);
+      messages.scrollTop = messages.scrollHeight;
+      reportHeight();
+      return;
+    }
+  });
+}
+
+// ── Claude final response ──
 if (window.chatAPI.onMessage) {
   window.chatAPI.onMessage((data) => {
-    thinkingEl.style.display = "none";
+    thinkingRow.classList.remove("visible");
     sendBtn.disabled = false;
-    addMessage(data.text || "", "claude");
+    // Finalize the streaming bubble — remove blinking cursor.
+    if (streamBubble) {
+      streamBubble.classList.remove("streaming");
+      streamBubble = null;
+    }
+    // If we streamed text this turn, don't duplicate the final message.
+    if (!streamedAny) addMessage(data.text || "", "claude");
+    streamedAny = false;
     input.focus();
   });
 }
@@ -334,6 +686,129 @@ function doSend() {
 }
 
 sendBtn.addEventListener("click", doSend);
+stopBtn.addEventListener("click", () => {
+  if (window.chatAPI.cancel) window.chatAPI.cancel();
+  if (streamBubble) { streamBubble.classList.remove("streaming"); streamBubble = null; }
+});
+
+// ── Slash command autocomplete ──
+// Union of Claude Code native commands + CLAWD-BOT extras.
+const SLASH_COMMANDS = [
+  { cmd: "/help",        desc: "Claude Code help" },
+  { cmd: "/clear",       desc: "reset Claude Code context" },
+  { cmd: "/compact",     desc: "compact conversation" },
+  { cmd: "/model",       desc: "pick model (interactive)" },
+  { cmd: "/memory",      desc: "view / edit memory" },
+  { cmd: "/status",      desc: "session status" },
+  { cmd: "/cost",        desc: "token + cost info" },
+  { cmd: "/mcp",         desc: "manage MCP servers" },
+  { cmd: "/agents",      desc: "manage subagents" },
+  { cmd: "/hooks",       desc: "manage hooks" },
+  { cmd: "/fast",        desc: "Fast mode (Opus only)" },
+  { cmd: "/keybindings", desc: "customize keybindings" },
+  { cmd: "/restart",     desc: "CLAWD-BOT: kill + new session" },
+  { cmd: "/cwd",         desc: "CLAWD-BOT: view/change cwd" },
+  { cmd: "/name",        desc: "CLAWD-BOT: rename terminal" },
+];
+let slashActive = -1;
+let slashMatches = [];
+
+function renderSlash() {
+  slashEl.innerHTML = "";
+  if (!slashMatches.length) { slashEl.classList.remove("visible"); return; }
+  slashMatches.forEach((m, i) => {
+    const el = document.createElement("div");
+    el.className = "slash-item" + (i === slashActive ? " active" : "");
+    el.innerHTML = `<span class="cmd">${m.cmd}</span><span class="desc">${m.desc}</span>`;
+    el.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      applySlash(m.cmd);
+    });
+    slashEl.appendChild(el);
+  });
+  slashEl.classList.add("visible");
+}
+function applySlash(cmd) {
+  input.value = cmd + " ";
+  slashMatches = [];
+  slashActive = -1;
+  renderSlash();
+  input.focus();
+}
+function updateSlash() {
+  const v = input.value;
+  if (!v.startsWith("/")) { slashMatches = []; slashActive = -1; renderSlash(); return; }
+  const token = (v.split(/\s+/)[0] || "").toLowerCase();
+  slashMatches = SLASH_COMMANDS.filter(c => c.cmd.startsWith(token));
+  slashActive = slashMatches.length ? 0 : -1;
+  renderSlash();
+}
+input.addEventListener("input", updateSlash);
+input.addEventListener("keydown", (e) => {
+  if (!slashMatches.length) return;
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    slashActive = (slashActive + 1) % slashMatches.length;
+    renderSlash();
+  } else if (e.key === "ArrowUp") {
+    e.preventDefault();
+    slashActive = (slashActive - 1 + slashMatches.length) % slashMatches.length;
+    renderSlash();
+  } else if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && slashActive >= 0 && input.value.trim() === slashMatches[slashActive].cmd.slice(0, input.value.trim().length))) {
+    // Tab completes; Enter completes only if still just the partial command
+    e.preventDefault();
+    applySlash(slashMatches[slashActive].cmd);
+  } else if (e.key === "Escape") {
+    slashMatches = []; slashActive = -1; renderSlash();
+  }
+}, true);
+
+// ── Manual corner resize ──
+function wireGrip(gripId, corner) {
+  const grip = document.getElementById(gripId);
+  if (!grip) return;
+  let startX = 0, startY = 0, dragging = false;
+
+  grip.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    dragging = true;
+    startX = e.screenX;
+    startY = e.screenY;
+    grip.setPointerCapture(e.pointerId);
+    if (window.chatAPI.resizeStart) window.chatAPI.resizeStart();
+  });
+
+  grip.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    const dx = e.screenX - startX;
+    const dy = e.screenY - startY;
+    if (window.chatAPI.resizeDelta) window.chatAPI.resizeDelta(dx, dy, corner);
+  });
+
+  const end = (e) => {
+    if (!dragging) return;
+    dragging = false;
+    try { grip.releasePointerCapture(e.pointerId); } catch {}
+    if (window.chatAPI.resizeEnd) window.chatAPI.resizeEnd();
+  };
+  grip.addEventListener("pointerup",     end);
+  grip.addEventListener("pointercancel", end);
+}
+wireGrip("gripBr", "br");
+wireGrip("gripBl", "bl");
+
+// ── Aero-Snap shortcuts: Win+←/→/↑/↓ snaps the bubble ──
+window.addEventListener("keydown", (e) => {
+  if (!(e.metaKey || e.getModifierState("OS") || e.getModifierState("Win"))) return;
+  let where = null;
+  if (e.key === "ArrowLeft")  where = "left";
+  if (e.key === "ArrowRight") where = "right";
+  if (e.key === "ArrowUp")    where = "max";
+  if (e.key === "ArrowDown")  where = "restore";
+  if (!where) return;
+  e.preventDefault();
+  if (window.chatAPI.snap) window.chatAPI.snap(where);
+});
 closeBtn.addEventListener("click", () => window.chatAPI.close());
 
 input.addEventListener("keydown", (e) => {

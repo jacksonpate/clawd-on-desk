@@ -178,6 +178,16 @@ function hydrateSystemBackedSettings() {
 // Capture window/mini runtime state into the controller and write to disk.
 // Replaces the legacy `savePrefs()` callsites — they used to read fresh
 // `win.getBounds()` and `_mini.*` at save time, so we mirror that here.
+// Debounced persist so every walking-step doesn't slam the disk.
+let _persistTimer = null;
+function schedulePositionPersist() {
+  if (_persistTimer) return;
+  _persistTimer = setTimeout(() => {
+    _persistTimer = null;
+    try { flushRuntimeStateToPrefs(); } catch (_) {}
+  }, 30000);
+}
+
 function flushRuntimeStateToPrefs() {
   if (!win || win.isDestroyed()) return;
   const bounds = win.getBounds();
@@ -681,6 +691,7 @@ const _tickCtx = {
     const size = getCurrentPixelSize();
     win.setBounds({ x, y, width: size.width, height: size.height });
     syncHitWin();
+    schedulePositionPersist();
   },
 };
 const _tick = require("./tick")(_tickCtx);
@@ -727,10 +738,41 @@ const _responseMulti = require("./response-multi")({
   get sessions()     { return sessions; },
   get sessionNames() { return sessionNames; },
   getNearestWorkArea: (x, y) => getNearestWorkArea(x, y),
+  openChat:          (sid) => { if (_chat && _chat.show) _chat.show(sid); },
 });
 
+// Summarize a Claude response down to ~2 sentences / 180 chars for the bubble.
+// Strips markdown noise so heading/hr lines don't dominate the snippet.
+function summarizeForBubble(text) {
+  if (!text) return "";
+  let s = String(text)
+    .replace(/```[\s\S]*?```/g, " ")      // fenced code blocks
+    .replace(/`[^`\n]+`/g, " ")           // inline code
+    .replace(/^#{1,6}\s+.*$/gm, " ")      // markdown headings
+    .replace(/^\s*[-*_]{3,}\s*$/gm, " ")  // horizontal rules --- *** ___
+    .replace(/^\s*[-*+]\s+/gm, "")        // bullet markers
+    .replace(/^\s*\d+\.\s+/gm, "")        // numbered list markers
+    .replace(/[*_~]{1,3}/g, "")           // bold/italic/strike marks
+    .replace(/^\s*>\s?/gm, "")            // blockquote >
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!s) return "";
+  const sentences = s.match(/[^.!?]+[.!?]+(\s|$)/g);
+  let out;
+  if (sentences && sentences.length) {
+    out = sentences.slice(0, 2).join(" ").trim();
+  } else {
+    out = s;
+  }
+  if (out.length > 180) out = out.slice(0, 179) + "…";
+  return out;
+}
+
 // Wire showResponse into _chatCtx so chat.js can call it
-_chatCtx.showResponse = (text, sid) => _responseMulti.show(text, sid);
+// Always fire the summary bubble when a response completes — notifies Jackson even if the chat is open.
+_chatCtx.showResponse = (text, sid) => {
+  _responseMulti.show(summarizeForBubble(text), sid);
+};
 
 // ── Session picker bubble (Shift+Right-click) ──
 const _sessionPicker = require("./session-picker")({
@@ -933,7 +975,9 @@ const _serverCtx = {
   showPermissionBubble,
   replyOpencodePermission,
   permLog,
-  showResponse: (text, sid) => _responseMulti.show(text, sid),
+  showResponse: (text, sid) => {
+    _responseMulti.show(summarizeForBubble(text), sid);
+  },
   isSessionAllowed: (sessionId, event) => {
     // Always let SessionStart through so every session registers in the Map
     // (makes them visible in the UI / available to pin). State changes from
