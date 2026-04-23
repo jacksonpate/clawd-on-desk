@@ -119,8 +119,8 @@ const STRINGS = {
     animOverridesModalUse: "Use this file",
     animOverridesModalCancel: "Cancel",
     animOverridesRefresh: "Refresh list",
-    sidebarSessions: "Sessions",
-    sessionsTitle: "Sessions",
+    sidebarSessions: "Terminals",
+    sessionsTitle: "Terminals",
     sessionsSubtitle: "Active Claude Code sessions. Pin one to lock Clawd to it — all other sessions will be ignored.",
     sessionsEmpty: "No active sessions.",
     sessionsPinned: "Pinned",
@@ -1498,143 +1498,171 @@ const SESSION_STATE_COLOR = {
 async function renderSessionsTab(parent) {
   if (sessionsPollTimer) { clearInterval(sessionsPollTimer); sessionsPollTimer = null; }
 
+  // Colors per terminal slot — set by terminal-manager, passed through listTerminals()
+
+
   const h1 = document.createElement("h1");
-  h1.textContent = t("sessionsTitle");
+  h1.textContent = "Terminals";
   parent.appendChild(h1);
 
   const sub = document.createElement("p");
   sub.className = "tab-subtitle";
-  sub.textContent = "Active Claude Code sessions. Check one or more to lock Clawd to those sessions only. Uncheck all to respond to every session.";
+  sub.textContent = "CLAWD-BOT's 4 hidden Claude terminals. Click one to make it active — chat routes there.";
   parent.appendChild(sub);
 
-  // Header row: session count + "Clear all" link
-  const headerRow = document.createElement("div");
-  headerRow.style.cssText = "display:flex;align-items:center;justify-content:space-between;margin-top:16px;margin-bottom:8px;";
-  const countLabel = document.createElement("span");
-  countLabel.style.cssText = "font-size:12px;font-weight:600;color:var(--text-sub);text-transform:uppercase;letter-spacing:0.04em;";
-  headerRow.appendChild(countLabel);
-  const clearBtn = document.createElement("button");
-  clearBtn.className = "btn-secondary";
-  clearBtn.style.cssText = "font-size:11px;padding:2px 8px;";
-  clearBtn.textContent = "Clear stale";
-  clearBtn.addEventListener("click", async () => {
-    await window.settingsAPI.clearStaleSessions();
-    await window.settingsAPI.clearPinnedSessions();
-    refresh();
-  });
-  headerRow.appendChild(clearBtn);
-  parent.appendChild(headerRow);
-
   const list = document.createElement("div");
-  list.style.cssText = "display:flex;flex-direction:column;gap:6px;";
+  list.style.cssText = "display:flex;flex-direction:column;gap:8px;margin-top:16px;";
   parent.appendChild(list);
 
-  async function refresh() {
-    if (activeTab !== "sessions") { clearInterval(sessionsPollTimer); sessionsPollTimer = null; return; }
-    const { sessions, pinnedSessionIds, selectedSessionIds } = await window.settingsAPI.listSessions();
-    const pinned = new Set(pinnedSessionIds || []);
-    const selected = new Set(selectedSessionIds || []);
+  // ── inline rename state ──────────────────────────────────────────────
+  let renamingId = null;
 
-    const selectedCount = selected.size;
-    countLabel.textContent = sessions.length
-      ? `${sessions.length} session${sessions.length !== 1 ? "s" : ""}${selectedCount ? `  ·  ${selectedCount} in cycle` : "  ·  none selected"}`
-      : "No sessions";
-    clearBtn.style.display = sessions.length ? "" : "none";
+  async function refresh(force = false) {
+    if (activeTab !== "sessions") { clearInterval(sessionsPollTimer); sessionsPollTimer = null; return; }
+    // Poll timer rebuilds are blocked while renaming — explicit calls (force=true) always go through
+    if (!force && renamingId !== null) return;
+
+    let terminals;
+    try {
+      terminals = await window.settingsAPI.listTerminals();
+    } catch (_) { return; }
+    if (!terminals || !terminals.length) return;
+
+    // Determine which is active
+    const activeId = terminals.find(t => t.active)?.id || terminals[0].id;
 
     list.innerHTML = "";
 
-    if (!sessions.length) {
-      const empty = document.createElement("p");
-      empty.style.cssText = "color:var(--text-sub);font-size:13px;padding:8px 0;";
-      empty.textContent = "No active sessions yet — send a message in Claude Code to register one.";
-      list.appendChild(empty);
-      return;
-    }
+    for (const term of terminals) {
+      const isActive   = term.active || false;
+      const isBusy     = term.busy;
+      const C          = term.color || "#7A9E7E"; // per-terminal color
+      const stateLabel = isBusy ? "Thinking…" : "Idle";
+      const stateColor = isBusy ? "#f59e0b" : "#71717a";
 
-    for (const s of sessions) {
-      const isSelected = selected.has(s.id); // in cycling pool
-      const isActive = pinned.has(s.id);     // currently pinned/active
-      const isOffline = !!s.offline;
-      const stateLabel = SESSION_STATE_LABEL[s.state] || "Idle";
-      const stateColor = SESSION_STATE_COLOR[s.state] || "#71717a";
-      const folderName = s.cwd ? s.cwd.split(/[\\/]/).pop() : s.id.slice(0, 8);
+      const card = document.createElement("div");
+      card.style.cssText = `
+        display:flex;align-items:center;gap:12px;padding:12px 14px;
+        background:${isActive ? C + "1A" : "var(--input-bg)"};
+        border:1.5px solid ${isActive ? C : "var(--card-border)"};
+        border-radius:10px;cursor:pointer;
+        transition:border-color 0.15s,background 0.15s;
+      `;
 
-      // Row: selected = teal border, active = orange glow on top of teal
-      const borderColor = isActive ? "#d97757" : isSelected ? "#2dd4bf" : "var(--card-border)";
-      const bg = isActive ? "rgba(217,119,87,0.08)" : isSelected ? "rgba(45,212,191,0.05)" : "var(--input-bg)";
-
-      const row = document.createElement("div");
-      row.style.cssText = `display:flex;align-items:center;gap:12px;padding:10px 14px;
-        background:${bg};
-        border:1.5px solid ${isOffline && isSelected ? "rgba(45,212,191,0.4)" : borderColor};
-        border-radius:10px;cursor:pointer;transition:border-color 0.15s,background 0.15s;
-        opacity:${isOffline ? "0.6" : "1"};`;
-
-      // Checkbox — teal when selected, orange badge overlay when active
-      const check = document.createElement("span");
-      check.style.cssText = `width:18px;height:18px;border-radius:5px;
-        border:2px solid ${isSelected ? "#2dd4bf" : "var(--card-border)"};
-        background:${isSelected ? "#2dd4bf" : "transparent"};
-        display:flex;align-items:center;justify-content:center;
-        flex-shrink:0;transition:all 0.15s;font-size:11px;color:#fff;font-weight:700;`;
-      check.textContent = isSelected ? "✓" : "";
-      row.appendChild(check);
-
-      // State dot
+      // Colored dot
       const dot = document.createElement("span");
-      dot.style.cssText = `width:7px;height:7px;border-radius:50%;background:${stateColor};flex-shrink:0;`;
-      row.appendChild(dot);
+      dot.style.cssText = `width:8px;height:8px;border-radius:50%;flex-shrink:0;
+        background:${isActive ? C : "#71717a"};
+        ${isActive ? `box-shadow:0 0 6px ${C};` : ""}`;
+      card.appendChild(dot);
 
-      // Label
-      const label = document.createElement("div");
-      label.style.cssText = "flex:1;min-width:0;";
+      // Name / rename area
+      const nameWrap = document.createElement("div");
+      nameWrap.style.cssText = "flex:1;min-width:0;";
 
-      const nameEl = document.createElement("div");
-      nameEl.style.cssText = "font-size:13px;font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
-      nameEl.textContent = folderName + (s.host ? ` @ ${s.host}` : "") + (s.headless ? " 🤖" : "");
-      label.appendChild(nameEl);
+      if (renamingId === term.id) {
+        // Inline rename input
+        const inp = document.createElement("input");
+        inp.type = "text";
+        inp.value = term.name;
+        inp.style.cssText = `font-size:13px;font-weight:600;color:var(--text-primary);
+          background:var(--input-bg);border:1px solid ${C};border-radius:5px;
+          padding:2px 6px;width:100%;outline:none;`;
+        inp.addEventListener("click", e => e.stopPropagation());
+        inp.addEventListener("keydown", async e => {
+          if (e.key === "Enter") {
+            const newName = inp.value.trim();
+            if (newName) await window.settingsAPI.renameTerminal(term.id, newName);
+            renamingId = null;
+            refresh(true);
+          } else if (e.key === "Escape") {
+            renamingId = null;
+            refresh(true);
+          }
+        });
+        inp.addEventListener("blur", async () => {
+          const newName = inp.value.trim();
+          if (newName) await window.settingsAPI.renameTerminal(term.id, newName);
+          renamingId = null;
+          refresh(true);
+        });
+        nameWrap.appendChild(inp);
+        // Focus after render
+        requestAnimationFrame(() => inp.focus());
+      } else {
+        const nameEl = document.createElement("div");
+        nameEl.style.cssText = `font-size:13px;font-weight:600;
+          color:${isActive ? C : "var(--text-primary)"};
+          white-space:nowrap;overflow:hidden;text-overflow:ellipsis;`;
+        nameEl.textContent = term.name;
+        nameWrap.appendChild(nameEl);
 
-      const metaEl = document.createElement("div");
-      metaEl.style.cssText = "font-size:11px;color:var(--text-sub);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
-      metaEl.textContent = (s.cwd || s.id.slice(0, 16));
-      label.appendChild(metaEl);
+        const metaEl = document.createElement("div");
+        metaEl.style.cssText = "font-size:11px;color:var(--text-sub);margin-top:2px;";
+        metaEl.textContent = term.id.toUpperCase() + " · Click name to rename";
+        nameWrap.appendChild(metaEl);
+      }
+      card.appendChild(nameWrap);
 
-      row.appendChild(label);
-
-      // Right side: active badge + state
-      const rightSide = document.createElement("div");
-      rightSide.style.cssText = "display:flex;flex-direction:column;align-items:flex-end;gap:3px;flex-shrink:0;";
+      // Right side
+      const right = document.createElement("div");
+      right.style.cssText = "display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0;";
 
       if (isActive) {
-        const activeBadge = document.createElement("span");
-        activeBadge.style.cssText = "font-size:10px;font-weight:700;color:#d97757;background:rgba(217,119,87,0.15);padding:1px 5px;border-radius:4px;";
-        activeBadge.textContent = "ACTIVE";
-        rightSide.appendChild(activeBadge);
+        const badge = document.createElement("span");
+        badge.style.cssText = `font-size:10px;font-weight:700;color:${C};
+          background:${C}26;padding:1px 7px;border-radius:4px;letter-spacing:0.03em;`;
+        badge.textContent = "ACTIVE";
+        right.appendChild(badge);
       }
 
-      const badge = document.createElement("span");
-      badge.style.cssText = `font-size:11px;font-weight:600;color:${stateColor};`;
-      badge.textContent = stateLabel;
-      rightSide.appendChild(badge);
-      row.appendChild(rightSide);
+      const stateBadge = document.createElement("span");
+      stateBadge.style.cssText = `font-size:11px;font-weight:600;color:${stateColor};`;
+      stateBadge.textContent = stateLabel;
+      right.appendChild(stateBadge);
 
-      // Click = toggle in/out of cycling pool
-      row.addEventListener("click", async () => {
-        await window.settingsAPI.toggleSelectedSession(s.id);
-        refresh();
+      const clearBtn = document.createElement("button");
+      clearBtn.className = "btn-secondary";
+      clearBtn.style.cssText = "font-size:10px;padding:2px 7px;margin-top:2px;";
+      clearBtn.textContent = "Clear history";
+      clearBtn.addEventListener("click", async e => {
+        e.stopPropagation();
+        await window.settingsAPI.clearTerminalHistory(term.id);
+        refresh(true);
+      });
+      right.appendChild(clearBtn);
+
+      card.appendChild(right);
+
+      // Click card = activate (but not during rename)
+      card.addEventListener("click", async () => {
+        if (renamingId === term.id) return;
+        await window.settingsAPI.setActiveTerminal(term.id);
+        refresh(true);
       });
 
-      list.appendChild(row);
+      // Click name = rename (when not already renaming)
+      if (renamingId !== term.id) {
+        const nameEl = nameWrap.querySelector("div");
+        if (nameEl) {
+          nameEl.addEventListener("click", async e => {
+            e.stopPropagation();
+            renamingId = term.id;
+            // Also activate this terminal
+            await window.settingsAPI.setActiveTerminal(term.id);
+            refresh(true);
+          });
+        }
+      }
+
+      list.appendChild(card);
     }
 
     // Hint
-    if (sessions.length && !list.querySelector(".cycle-hint")) {
-      const hint = document.createElement("p");
-      hint.className = "cycle-hint";
-      hint.style.cssText = "color:var(--text-sub);font-size:11px;margin-top:8px;text-align:center;";
-      hint.textContent = "Click sessions to add to cycle pool · Ctrl+Right-click Clawd to switch";
-      list.appendChild(hint);
-    }
+    const hint = document.createElement("p");
+    hint.style.cssText = "color:var(--text-sub);font-size:11px;margin-top:10px;text-align:center;";
+    hint.textContent = "Click a terminal to activate · Click its name to rename it";
+    list.appendChild(hint);
   }
 
   await refresh();

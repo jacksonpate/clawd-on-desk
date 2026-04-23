@@ -17,33 +17,54 @@ const EDITOR_COLOR = {
 };
 const DEFAULT_COLOR = "#6b7280";
 
-const AUTO_DISMISS = 20000;   // ms
+const AUTO_DISMISS = 30000;   // ms
 const WINDOW_H     = 130;     // initial height; resized by renderer
 
 // Slot positions relative to Clawd win center.
 // dx/dy → window top-left offset.
 // Right-side slots: dx already accounts for 40px tail area left of card.
+// top:true  → dy is the tip (bottom edge) offset from pet center — bubble grows upward
+// top:false → dy is the tip (top edge) offset from pet center — bubble grows downward
 const SLOTS = [
-  { id: "tl", dx: -242, dy: -129, w: 226 },
-  { id: "tr", dx:   22, dy: -129, w: 220 },
-  { id: "bl", dx: -242, dy:   17, w: 237 },
-  { id: "br", dx:   22, dy:   17, w: 220 },
+  { id: "tl", dx: -250, dy: -119, top: true,  w: 226 },
+  { id: "tr", dx:   30, dy: -119, top: true,  w: 220 },
+  { id: "bl", dx: -252, dy:   67, top: false, w: 237 },
+  { id: "br", dx:   32, dy:   67, top: false, w: 220 },
 ];
+
+// Tip Y offset for top slots = dy + WINDOW_H (bottom of initial window)
+const TIP_DY = {
+  tl: -119 + WINDOW_H + 15,
+  tr: -119 + WINDOW_H + 15,
+  bl: 73,
+  br: 73,
+};
 
 module.exports = function initResponseMulti(ctx) {
 
-  const wins   = {};  // slotId → BrowserWindow
-  const timers = {};  // slotId → setTimeout handle
+  const wins          = {};  // slotId → BrowserWindow
+  const timers        = {};  // slotId → setTimeout handle
+  const slotHeight    = {};  // slotId → last known height
+  const heightReady   = {};  // slotId → true once renderer has confirmed real height
+  // Shared tip Y per ROW — tl+tr share one value, bl+br share one value.
+  // Set by reposition() at rest. Never per-slot so the two can never diverge.
+  let topTipY = null;
+  let botTipY = null;
   let ipcRegistered = false;
 
   // ── Helpers ──────────────────────────────────────────────────────────────
 
-  function slotBounds(slot) {
+  function slotBounds(slot, h) {
     if (!ctx.win || ctx.win.isDestroyed()) return null;
-    const b  = ctx.win.getBounds();
-    const cx = b.x + Math.round(b.width  / 2);
-    const cy = b.y + Math.round(b.height / 2);
-    return { x: cx + slot.dx, y: cy + slot.dy, width: slot.w, height: WINDOW_H };
+    const b   = ctx.win.getBounds();
+    const cx  = b.x + Math.round(b.width  / 2);
+    const cy  = b.y + Math.round(b.height / 2);
+    const height = h || WINDOW_H;
+    // Top slots: anchor bottom (tip) edge; bottom slots: anchor top (tip) edge
+    const y = slot.top
+      ? cy + TIP_DY[slot.id] - height   // tip fixed, bubble grows upward
+      : cy + TIP_DY[slot.id];           // tip fixed, bubble grows downward
+    return { x: cx + slot.dx, y, width: slot.w, height };
   }
 
   function freeSlot() {
@@ -55,6 +76,7 @@ module.exports = function initResponseMulti(ctx) {
     delete timers[slotId];
     const w = wins[slotId];
     delete wins[slotId];
+    heightReady[slotId] = false;
     if (w && !w.isDestroyed()) w.close();
   }
 
@@ -68,8 +90,15 @@ module.exports = function initResponseMulti(ctx) {
 
     const session = sid && ctx.sessions ? ctx.sessions.get(sid) : null;
     const customName = sid && ctx.sessionNames && ctx.sessionNames[sid];
-    const label   = customName || "Clawd";
-    const color   = EDITOR_COLOR[session && session.editor] || DEFAULT_COLOR;
+    let label, color;
+    if (session && session.clawdBot) {
+      // CLAWD-BOT terminal — use its stored name and color
+      label = session.terminalName || customName || "Clawd";
+      color = session.color || DEFAULT_COLOR;
+    } else {
+      label = customName || "Clawd";
+      color = EDITOR_COLOR[session && session.editor] || DEFAULT_COLOR;
+    }
     const bounds  = slotBounds(slot);
     if (!bounds) return;
 
@@ -92,7 +121,12 @@ module.exports = function initResponseMulti(ctx) {
 
     if (isWin) win.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
 
-    wins[slot.id] = win;
+    wins[slot.id]         = win;
+    slotHeight[slot.id]   = WINDOW_H;
+    heightReady[slot.id]  = false;  // don't let reposition() touch this slot until renderer confirms height
+    // Seed shared row tipY on first spawn so bubble-resize has something to work with
+    if (slot.top  && topTipY == null) topTipY = bounds.y + WINDOW_H;
+    if (!slot.top && botTipY == null) botTipY = bounds.y;
 
     win.loadFile(path.join(__dirname, "response-bubble-multi.html"));
 
@@ -130,19 +164,35 @@ module.exports = function initResponseMulti(ctx) {
       if (!w || w.isDestroyed()) return;
       const s = SLOTS.find(x => x.id === slot);
       if (!s) return;
-      const b = slotBounds(s);
-      if (b) w.setBounds({ ...b, height: Math.max(h + 4, WINDOW_H) });
+      const clampedH = Math.min(Math.max(h + 4, WINDOW_H), 260);
+      slotHeight[slot]  = clampedH;
+      heightReady[slot] = true;  // renderer has confirmed real height — safe to include in reposition
+      reposition();
     });
   }
 
   // ── Cleanup ───────────────────────────────────────────────────────────────
 
   function reposition() {
+    if (!ctx.win || ctx.win.isDestroyed()) return;
+    const b  = ctx.win.getBounds();
+    const cx = b.x + Math.round(b.width  / 2);
+    const cy = b.y + Math.round(b.height / 2);
+
+    // Update shared row tip Ys — both top slots get IDENTICAL value, both bottom slots get IDENTICAL value
+    topTipY = cy + TIP_DY["tl"];
+    botTipY = cy + TIP_DY["bl"];
+
     for (const s of SLOTS) {
       const w = wins[s.id];
       if (!w || w.isDestroyed()) continue;
-      const b = slotBounds(s);
-      if (b) w.setPosition(b.x, b.y);
+      if (!heightReady[s.id]) continue;  // skip until renderer confirms real height — prevents WINDOW_H stomping a correct sibling
+      const rowTipY = s.top ? topTipY : botTipY;
+      const h = slotHeight[s.id] || WINDOW_H;
+      const x = cx + s.dx;
+      const y = s.top ? rowTipY - h : rowTipY;
+      // setBounds (not setPosition) so height is always explicitly set — no mismatch possible
+      w.setBounds({ x, y, width: s.w, height: h });
     }
   }
 

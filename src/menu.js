@@ -409,6 +409,11 @@ module.exports = function initMenu(ctx) {
   function buildContextMenu() {
     const template = [
       {
+        label: "Chat with Claude",
+        click: () => { if (typeof ctx.openChat === "function") ctx.openChat(); },
+      },
+      { type: "separator" },
+      {
         label: t("proportional"),
         submenu: buildProportionalSubmenu(),
       },

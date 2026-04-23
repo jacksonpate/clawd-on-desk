@@ -49,4 +49,9 @@ contextBridge.exposeInMainWorld("settingsAPI", {
   onChanged: (cb) => {
     if (typeof cb === "function") listeners.add(cb);
   },
+  // ── CLAWD-BOT terminal API ──
+  listTerminals:       ()       => ipcRenderer.invoke("clawd:list-terminals"),
+  setActiveTerminal:   (id)     => ipcRenderer.invoke("clawd:set-active-terminal", id),
+  renameTerminal:      (id, nm) => ipcRenderer.invoke("clawd:rename-terminal", id, nm),
+  clearTerminalHistory:(id)     => ipcRenderer.invoke("clawd:clear-terminal-history", id),
 });

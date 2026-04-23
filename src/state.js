@@ -527,6 +527,7 @@ function cleanStaleSessions() {
   let changed = false;
   let removedNonHeadless = false;
   for (const [id, s] of sessions) {
+    if (s.clawdBot) continue; // CLAWD-BOT is permanent — never stale-delete it
     const age = now - s.updatedAt;
 
     if (s.pidReachable && s.agentPid && !isProcessAlive(s.agentPid)) {
@@ -764,15 +765,24 @@ function formatElapsed(ms) {
   return ctx.t("sessionHrAgo").replace("{n}", hr);
 }
 
+const CLAWDBOT_SESSION_ID = "clawd-bot";
+const CLAWDBOT_COLOR     = "#03244D"; // Auburn University blue
+
 function buildSessionSubmenu() {
   const entries = [];
   for (const [id, s] of sessions) {
-    entries.push({ id, state: s.state, updatedAt: s.updatedAt, sourcePid: s.sourcePid, cwd: s.cwd, editor: s.editor, pidChain: s.pidChain, host: s.host, headless: s.headless, agentId: s.agentId });
+    entries.push({ id, state: s.state, updatedAt: s.updatedAt, sourcePid: s.sourcePid, cwd: s.cwd, editor: s.editor, pidChain: s.pidChain, host: s.host, headless: s.headless, agentId: s.agentId, clawdBot: s.clawdBot });
   }
-  if (entries.length === 0) {
+
+  // Always show CLAWD-BOT even if it's the only entry — don't return noSessions
+  const nonBot = entries.filter(e => !e.clawdBot);
+  if (nonBot.length === 0 && entries.every(e => e.clawdBot)) {
+    // only bot — still show it
+  } else if (entries.length === 0) {
     return [{ label: ctx.t("noSessions"), enabled: false }];
   }
-  entries.sort((a, b) => {
+
+  nonBot.sort((a, b) => {
     const pa = STATE_PRIORITY[a.state] || 0;
     const pb = STATE_PRIORITY[b.state] || 0;
     if (pb !== pa) return pb - pa;
@@ -780,8 +790,22 @@ function buildSessionSubmenu() {
   });
 
   const now = Date.now();
+  const pins = ctx.pinnedSessionIds;
 
   function buildItem(e) {
+    // ── CLAWD-BOT special item ──
+    if (e.clawdBot) {
+      const isPinned = pins && pins.has(e.id);
+      return {
+        label: `${isPinned ? "📌 " : "   "}C-L-A-W-D-B-O-T`,
+        enabled: true,
+        click: () => {
+          // Toggle pin via existing IPC handler logic (replicated here for direct call)
+          if (ctx.toggleClawdBotPin) ctx.toggleClawdBotPin();
+        },
+      };
+    }
+
     const stateText = ctx.t(STATE_LABEL_KEY[e.state] || "sessionIdle");
     const folder = e.cwd ? path.basename(e.cwd) : (e.id.length > 6 ? e.id.slice(0, 6) + ".." : e.id);
     const name = ctx.showSessionId ? `${folder} #${e.id.slice(-3)}` : folder;
@@ -797,18 +821,32 @@ function buildSessionSubmenu() {
     return item;
   }
 
-  // Single-pass grouping by host
-  const groups = new Map(); // key: host || "" for local
-  for (const e of entries) {
+  // CLAWD-BOT always appears first, pinned or not
+  const botEntry = entries.find(e => e.clawdBot);
+  const realEntries = nonBot; // already sorted
+
+  const items = [];
+  if (botEntry) {
+    items.push(buildItem(botEntry));
+    if (realEntries.length) items.push({ type: "separator" });
+  }
+
+  if (realEntries.length === 0) return items.length ? items : [{ label: ctx.t("noSessions"), enabled: false }];
+
+  // Single-pass grouping by host (real sessions only)
+  const groups = new Map();
+  for (const e of realEntries) {
     const key = e.host || "";
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(e);
   }
 
-  if (groups.size === 1 && groups.has("")) return entries.map(buildItem);
+  if (groups.size === 1 && groups.has("")) {
+    items.push(...realEntries.map(buildItem));
+    return items;
+  }
 
   // Build grouped menu: local first, then each remote host
-  const items = [];
   const local = groups.get("");
   if (local) {
     items.push({ label: `📍 ${ctx.t("sessionLocal")}`, enabled: false });

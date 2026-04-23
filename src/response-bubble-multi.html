@@ -25,7 +25,7 @@
     position: relative;
     width: 180px;
     background: #1c1c1e;
-    border: 1.5px solid rgba(255,255,255,0.10);
+    border: 2px solid rgba(255,255,255,0.10);
     border-radius: 14px;
     padding: 11px 13px 10px;
     box-shadow: 0 6px 24px rgba(0,0,0,0.55);
@@ -66,6 +66,24 @@
     font-size: 12px;
     color: rgba(255,255,255,0.75);
     line-height: 1.5;
+    max-height: 160px;
+    overflow-y: auto;
+    word-break: break-word;
+  }
+
+  /* Custom scrollbar for #text */
+  #text::-webkit-scrollbar {
+    width: 4px;
+  }
+  #text::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  #text::-webkit-scrollbar-thumb {
+    background: rgba(255,255,255,0.18);
+    border-radius: 99px;
+  }
+  #text::-webkit-scrollbar-thumb:hover {
+    background: rgba(255,255,255,0.32);
   }
 
   #footer {
@@ -146,6 +164,11 @@ window.bubbleAPI.onInit(({ text, label, color, slot, timerMs }) => {
   // Label
   labelEl.textContent = label;
   labelEl.style.color = color;
+
+  // Color the card border and tail stroke to match terminal color
+  card.style.borderColor = color;
+  const tailSvg = card.querySelector("svg path");
+  if (tailSvg) { tailSvg.setAttribute("stroke", color); }
 
   // Message
   textEl.textContent = text;

@@ -1,5 +1,5 @@
-// src/chat.js — Right-click chat bubble
-// Floating chat input that sends messages to the active Claude Code session.
+// src/chat.js — Per-terminal chat bubbles (one window per terminal)
+// T1=left, T2=right, T3=top, T4=bottom of pet. Draggable. Never close on blur.
 
 const { BrowserWindow, clipboard, ipcMain } = require("electron");
 const { execFile } = require("child_process");
@@ -13,6 +13,7 @@ const WIN_TOPMOST_LEVEL = "screen-saver";
 
 const BUBBLE_W = 340;
 const BUBBLE_H = 160;
+const MARGIN   = 10;
 
 const EDITOR_COLOR = {
   claude:      "#fb923c",
@@ -22,453 +23,388 @@ const EDITOR_COLOR = {
 };
 const DEFAULT_COLOR = "#6b7280";
 
+// Default anchor side per terminal
+const TERMINAL_SIDE = { t1: "left", t2: "right", t3: "top", t4: "bottom" };
+// Cardinal fallback order (no diagonals — stack near existing windows instead)
+const SIDE_FALLBACK = ["left", "right", "top", "bottom"];
+
 module.exports = function initChat(ctx) {
 
-let chatWin      = null;
-let measuredH    = BUBBLE_H;
-let ipcRegistered = false;
-let suppressUnfreeze = false; // true when closing due to a freeze command
-let manuallyFrozen = false;   // true while Clawd is frozen by "be still" command — persists across bubble opens
+const chatWins      = new Map(); // terminalId → BrowserWindow
+const winHeight     = new Map(); // terminalId → measured height (px)
+const userDragged   = new Set(); // terminals the user has manually moved
+const progMove      = new Set(); // terminals currently being moved by code (not user)
+const messageLogs   = new Map(); // terminalId → Array<{role,text}> — persists across bubble open/close
+const snapTimers    = new Map(); // terminalId → debounce handle for snap-back check
+const MAX_LOG       = 100;       // max messages to keep per terminal
+let ipcRegistered  = false;
+let suppressUnfreeze = false;
+let manuallyFrozen   = false;
 
-function getPosition() {
+// ── Position helpers ────────────────────────────────────────────────────────
+
+function checkFits(x, y, h, wa) {
+  return x >= wa.x && x + BUBBLE_W <= wa.x + wa.width &&
+         y >= wa.y && y + h        <= wa.y + wa.height;
+}
+
+function clamp(x, y, h, wa) {
+  return {
+    x: Math.round(Math.max(wa.x, Math.min(x, wa.x + wa.width  - BUBBLE_W))),
+    y: Math.round(Math.max(wa.y, Math.min(y, wa.y + wa.height - h))),
+  };
+}
+
+// Visual center offset — shifts all 4 bubbles relative to the robot's actual center
+const BUBBLE_OFFSET_X = 10;  // px right
+const BUBBLE_OFFSET_Y = 45;  // px down
+
+function computeSide(side, pet, wa, h) {
+  let x, y;
+  switch (side) {
+    case "left":   x = pet.x - BUBBLE_W - MARGIN;           y = pet.y + (pet.height - h) / 2; break;
+    case "right":  x = pet.x + pet.width + MARGIN;          y = pet.y + (pet.height - h) / 2; break;
+    case "top":    x = pet.x + (pet.width - BUBBLE_W) / 2;  y = pet.y - h - MARGIN;           break;
+    case "bottom": x = pet.x + (pet.width - BUBBLE_W) / 2;  y = pet.y + pet.height + MARGIN;  break;
+    default:       x = pet.x - BUBBLE_W - MARGIN;           y = pet.y;
+  }
+  x += BUBBLE_OFFSET_X;
+  y += BUBBLE_OFFSET_Y;
+  const fits = checkFits(x, y, h, wa);
+  return { ...clamp(x, y, h, wa), fits };
+}
+
+// Positions relative to an existing open chat window (above / below / left / right of it)
+function chatRelativePositions(ref, wa, h) {
+  const candidates = [
+    { x: ref.x,                      y: ref.y - h - MARGIN },      // above the chat
+    { x: ref.x,                      y: ref.y + ref.height + MARGIN }, // below the chat
+    { x: ref.x - BUBBLE_W - MARGIN,  y: ref.y },                   // left of the chat
+    { x: ref.x + ref.width + MARGIN, y: ref.y },                   // right of the chat
+  ];
+  return candidates
+    .filter(p => checkFits(p.x, p.y, h, wa))
+    .map(p => ({ ...clamp(p.x, p.y, h, wa), fits: true }));
+}
+
+function getPositionForTerminal(terminalId, h) {
   if (!ctx.win || ctx.win.isDestroyed()) return { x: 100, y: 100 };
-  const bounds  = ctx.win.getBounds();
-  const wa      = ctx.getNearestWorkArea(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
-  const margin  = 8;
+  const pet = ctx.win.getBounds();
+  const wa  = ctx.getNearestWorkArea(pet.x + pet.width / 2, pet.y + pet.height / 2);
+  h = h || BUBBLE_H;
 
-  // Try left of Clawd, then right, then clamp inside work area
-  let x = bounds.x - BUBBLE_W - margin;
-  if (x < wa.x) x = bounds.x + bounds.width + margin;
-  // Hard clamp to work area so it never escapes the monitor
-  x = Math.max(wa.x, Math.min(x, wa.x + wa.width - BUBBLE_W));
+  // 1. Try pet-relative cardinal sides (primary first)
+  const primary = TERMINAL_SIDE[terminalId] || "left";
+  const order   = [primary, ...SIDE_FALLBACK.filter(s => s !== primary)];
+  for (const side of order) {
+    const pos = computeSide(side, pet, wa, h);
+    if (pos.fits) return pos;
+  }
 
-  let y = bounds.y;
-  // Hard clamp vertically
-  y = Math.max(wa.y + margin, Math.min(y, wa.y + wa.height - measuredH - margin));
+  // 2. Try stacking around any already-open chat windows
+  for (const [tid, win] of chatWins) {
+    if (tid === terminalId || !win || win.isDestroyed()) continue;
+    const ref = win.getBounds();
+    const candidates = chatRelativePositions(ref, wa, h);
+    if (candidates.length) return candidates[0];
+  }
 
-  return { x: Math.round(x), y: Math.round(y) };
+  // 3. Last resort: clamp the primary side (pet is in a very tight corner)
+  return computeSide(primary, pet, wa, h);
+}
+
+// ── Message log helpers ─────────────────────────────────────────────────────
+
+function logMessage(terminalId, role, text) {
+  if (!messageLogs.has(terminalId)) messageLogs.set(terminalId, []);
+  const log = messageLogs.get(terminalId);
+  log.push({ role, text });
+  if (log.length > MAX_LOG) log.splice(0, log.length - MAX_LOG);
+}
+
+function getLog(terminalId) {
+  return messageLogs.get(terminalId) || [];
+}
+
+// ── Snap-back proximity check ───────────────────────────────────────────────
+
+const SNAP_RADIUS_H = 175;  // px — left/right terminals
+const SNAP_RADIUS_V = 120;  // px — top/bottom terminals (rectangle proportions)
+
+function checkSnapBack(terminalId) {
+  if (!userDragged.has(terminalId)) return;
+  const win = chatWins.get(terminalId);
+  if (!win || win.isDestroyed()) return;
+  if (!ctx.win || ctx.win.isDestroyed()) return;
+
+  const pet   = ctx.win.getBounds();
+  const bub   = win.getBounds();
+  const petCx = pet.x + pet.width  / 2;
+  const petCy = pet.y + pet.height / 2;
+  const bubCx = bub.x + bub.width  / 2;
+  const bubCy = bub.y + bub.height / 2;
+  const side   = TERMINAL_SIDE[terminalId];
+  const snapR  = (side === "top" || side === "bottom") ? SNAP_RADIUS_V : SNAP_RADIUS_H;
+  const dist   = Math.hypot(bubCx - petCx, bubCy - petCy);
+  if (dist >= snapR) return;
+
+  // Each terminal only snaps from its designated side
+  const onSide =
+    side === "left"   ? bubCx <= petCx :
+    side === "right"  ? bubCx >= petCx :
+    side === "top"    ? bubCy <= petCy :
+    side === "bottom" ? bubCy >= petCy : true;
+
+  if (onSide) {
+    userDragged.delete(terminalId);
+    repositionTerminal(terminalId);
+  }
+}
+
+// ── Session info ────────────────────────────────────────────────────────────
+
+function getSessionInfoForTerminal(terminalId) {
+  const tm = ctx.terminalManager;
+  if (tm && terminalId) {
+    const t = tm.getTerminals().find(x => x.id === terminalId);
+    if (t) return { name: t.name, color: t.color };
+  }
+  return { name: "C-L-A-W-D-B-O-T", color: "#7A9E7E" };
+}
+
+function getActiveTerminalId() {
+  const tm     = ctx.terminalManager;
+  const pinned = ctx.pinnedSessionIds;
+  if (!tm) return null;
+  return tm.TERMINAL_IDS.find(id => pinned && pinned.has(id)) || tm.getActiveId() || null;
+}
+
+// ── Find terminal ID from a WebContents sender ──────────────────────────────
+
+function findTerminalBySender(sender) {
+  for (const [tid, win] of chatWins) {
+    if (win && !win.isDestroyed() && win.webContents === sender) return tid;
+  }
+  return null;
+}
+
+// ── Window management ───────────────────────────────────────────────────────
+
+function setBoundsTracked(terminalId, win, bounds) {
+  progMove.add(terminalId);
+  win.setBounds(bounds);
+  // Clear flag after Electron processes the move event (next tick)
+  setImmediate(() => progMove.delete(terminalId));
+}
+
+function repositionTerminal(terminalId) {
+  const win = chatWins.get(terminalId);
+  if (!win || win.isDestroyed()) return;
+  const h = (winHeight.get(terminalId) || BUBBLE_H) + 4;
+
+  if (userDragged.has(terminalId)) {
+    // User placed this window — only update height, never move x/y
+    const cur = win.getBounds();
+    setBoundsTracked(terminalId, win, { ...cur, height: h });
+    return;
+  }
+
+  // Still anchored — update position + height
+  const { x, y } = getPositionForTerminal(terminalId, h - 4);
+  setBoundsTracked(terminalId, win, { x, y, width: BUBBLE_W, height: h });
 }
 
 function reposition() {
-  if (!chatWin || chatWin.isDestroyed()) return;
-  if (chatWin.isFocused()) return; // don't yank position while user is typing
-  const { x, y } = getPosition();
-  chatWin.setBounds({ x, y, width: BUBBLE_W, height: measuredH + 4 });
+  for (const [tid] of chatWins) repositionTerminal(tid);
 }
 
-// Commands that control Clawd directly — intercepted before sending to Claude Code
+function showTerminal(terminalId) {
+  if (!terminalId) return;
+
+  const existing = chatWins.get(terminalId);
+  if (existing && !existing.isDestroyed()) {
+    existing.focus();
+    existing.webContents.send("chat-session-update", getSessionInfoForTerminal(terminalId));
+    return;
+  }
+
+  const h = winHeight.get(terminalId) || BUBBLE_H;
+  const { x, y } = getPositionForTerminal(terminalId, h);
+
+  const win = new BrowserWindow({
+    width: BUBBLE_W,
+    height: h + 4,
+    x, y,
+    show:        false,
+    frame:       false,
+    transparent: true,
+    alwaysOnTop: true,
+    resizable:   false,
+    movable:     true,
+    skipTaskbar: true,
+    hasShadow:   false,
+    focusable:   true,
+    ...(isLinux ? { type: LINUX_WINDOW_TYPE } : {}),
+    ...(isMac   ? { type: "panel" }           : {}),
+    webPreferences: {
+      preload:          path.join(__dirname, "preload-chat-bubble.js"),
+      nodeIntegration:  false,
+      contextIsolation: true,
+    },
+  });
+
+  if (isWin) win.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL, 1);
+
+  chatWins.set(terminalId, win);
+  win.loadFile(path.join(__dirname, "chat-bubble.html"));
+
+  win.webContents.once("did-finish-load", () => {
+    win.webContents.send("chat-show", getSessionInfoForTerminal(terminalId));
+    win.show();
+    win.focus();
+    if (chatWins.size === 1 && ctx.freezeFollower) ctx.freezeFollower();
+  });
+
+  // Detect user drag — moved event without our programmatic flag = user dragged it
+  win.on("moved", () => {
+    if (!progMove.has(terminalId)) {
+      userDragged.add(terminalId); // now free-floating, stop anchoring to pet
+      // Debounced snap-back check — if bubble released near bot, re-anchor
+      clearTimeout(snapTimers.get(terminalId));
+      snapTimers.set(terminalId, setTimeout(() => checkSnapBack(terminalId), 400));
+    }
+  });
+
+  win.on("closed", () => {
+    chatWins.delete(terminalId);
+    userDragged.delete(terminalId); // next open starts anchored again
+    progMove.delete(terminalId);
+    if (chatWins.size === 0 && !suppressUnfreeze && !manuallyFrozen && ctx.unfreezeFollower) {
+      ctx.unfreezeFollower();
+    }
+    suppressUnfreeze = false;
+  });
+}
+
+function show() {
+  showTerminal(getActiveTerminalId());
+}
+
+function hide(terminalId) {
+  if (terminalId) {
+    const win = chatWins.get(terminalId);
+    if (!win || win.isDestroyed()) return;
+    win.webContents.send("chat-hide");
+    setTimeout(() => { if (win && !win.isDestroyed()) win.close(); }, 350);
+  } else {
+    for (const [tid, win] of chatWins) {
+      if (!win || win.isDestroyed()) continue;
+      win.webContents.send("chat-hide");
+      setTimeout(() => { if (win && !win.isDestroyed()) win.close(); }, 350);
+    }
+  }
+}
+
+// ── Message routing ─────────────────────────────────────────────────────────
+
 const FREEZE_CMDS   = /^(be still|stay|stay still|freeze|stop moving|don'?t move)[.,!?]*$/i;
 const UNFREEZE_CMDS = /^(you'?re? (good|free)|move|go|unfreeze|you can move( now)?|start moving)[.,!?]*$/i;
 
-function sendMessage(msg) {
+function sendMessage(msg, terminalId) {
   if (!msg) return;
-
-  // Intercept movement commands — handle locally, don't send to Claude Code
   const trimmed = msg.trim();
-  if (FREEZE_CMDS.test(trimmed)) {
-    manuallyFrozen = true;
-    suppressUnfreeze = true; // don't let this specific close undo the freeze
-    if (chatWin && !chatWin.isDestroyed()) {
-      chatWin.webContents.send("chat-hide");
-      setTimeout(() => { if (chatWin && !chatWin.isDestroyed()) { chatWin.close(); chatWin = null; } }, 350);
+
+  // ── Chat history recall — "chat memory", "chat past", "past chat" ────────
+  if (/^(chat memory|chat past|past chat)[.,!?]*$/i.test(trimmed)) {
+    const win = terminalId && chatWins.get(terminalId);
+    if (win && !win.isDestroyed()) {
+      const log = getLog(terminalId);
+      if (!log.length) {
+        win.webContents.send("chat-message", { text: "(no history yet)" });
+      } else {
+        log.forEach(entry => {
+          const channel = entry.role === "user" ? "chat-user-message" : "chat-message";
+          win.webContents.send(channel, { text: entry.text });
+        });
+      }
     }
+    return;
+  }
+
+  // Freeze/unfreeze — handled locally
+  if (FREEZE_CMDS.test(trimmed)) {
+    manuallyFrozen   = true;
+    suppressUnfreeze = true;
     if (ctx.freezeFollower) ctx.freezeFollower();
     return;
   }
   if (UNFREEZE_CMDS.test(trimmed)) {
-    manuallyFrozen = false;
+    manuallyFrozen   = false;
     suppressUnfreeze = false;
-    if (chatWin && !chatWin.isDestroyed()) {
-      chatWin.webContents.send("chat-hide");
-      setTimeout(() => { if (chatWin && !chatWin.isDestroyed()) { chatWin.close(); chatWin = null; } }, 350);
-    }
     if (ctx.unfreezeFollower) ctx.unfreezeFollower();
     return;
   }
 
-  // 1. Write to clipboard
-  clipboard.writeText(msg);
-
-  // 2. Start fade animation, then close after it plays
-  if (chatWin && !chatWin.isDestroyed()) {
-    chatWin.webContents.send("chat-hide");
-    setTimeout(() => {
-      if (chatWin && !chatWin.isDestroyed()) { chatWin.close(); chatWin = null; }
-    }, 350);
+  // ── CLAWD-BOT terminal routing ──────────────────────────────────────────
+  const tm = ctx.terminalManager;
+  if (tm && terminalId && tm.TERMINAL_IDS.includes(terminalId)) {
+    logMessage(terminalId, "user", msg);
+    const win = chatWins.get(terminalId);
+    if (win && !win.isDestroyed()) {
+      win.webContents.send("chat-user-message", { text: msg });
+      win.webContents.send("chat-thinking", true);
+    }
+    tm.sendToTerminal(terminalId, msg, (response, err) => {
+      const responseText = response || ("⚠ " + err);
+      logMessage(terminalId, "claude", responseText);
+      const w = chatWins.get(terminalId);
+      if (w && !w.isDestroyed()) {
+        w.webContents.send("chat-thinking", false);
+        w.webContents.send("chat-message", { text: responseText });
+      }
+      if (ctx.showResponse) ctx.showResponse(responseText, terminalId);
+    });
+    return;
   }
 
+  // ── Fallback: clipboard paste to editor (non-terminal sessions) ──────────
+  clipboard.writeText(msg);
+
+  const pinned  = ctx.pinnedSessionIds;
+  const hasPins = pinned && pinned.size > 0;
+
   if (isWin) {
-    // Pick best session (pinned first, else most recent)
-    let targetCwd = "", targetEditor = "", targetSourcePid = 0, targetHwnd = 0;
-    const pinned = ctx.pinnedSessionIds;
-    const hasPins = pinned && pinned.size > 0;
+    let targetCwd = "", targetEditor = "", targetSourcePid = 0;
     if (ctx.sessions) {
       let latest = 0;
       for (const [id, s] of ctx.sessions) {
         if (hasPins && !pinned.has(id)) continue;
+        if (s.clawdBot) continue;
         if ((s.updatedAt || 0) >= latest) {
           latest = s.updatedAt || 0;
-          targetCwd = s.cwd || "";
-          targetEditor = s.editor || "";
-          targetSourcePid = s.sourcePid || 0;
-          targetHwnd = s.terminalHwnd || 0;
+          targetCwd = s.cwd || ""; targetEditor = s.editor || ""; targetSourcePid = s.sourcePid || 0;
         }
       }
     }
-    // If pins are set but session not yet in Map (e.g. after Clawd restart),
-    // fall back to saved data from pinnedSessionCwds
-    // Fallback: if no sessions registered yet (hooks haven't fired since restart),
-    // read routing metadata from pinnedSessionCwds (persisted from last run)
-    if (hasPins && (!targetCwd || !targetEditor) && ctx.pinnedSessionCwds) {
-      for (const id of pinned) {
-        const saved = ctx.pinnedSessionCwds[id];
-        if (saved) {
-          if (!targetCwd)        targetCwd        = saved.cwd        || "";
-          if (!targetEditor)     targetEditor     = saved.editor     || "";
-          if (!targetSourcePid)  targetSourcePid  = saved.sourcePid  || 0;
-          break;
-        }
-      }
-    }
-    // Folder name from cwd for window title matching (e.g. "Project_P", "jpate")
     const folderName = targetCwd ? targetCwd.split(/[\\/]/).pop() : "";
-    try { require("fs").appendFileSync(require("path").join(require("os").homedir(), "AppData", "Roaming", "clawd-on-desk", "clawd-chat-debug.log"), `[${new Date().toISOString()}] editor=${targetEditor} sourcePid=${targetSourcePid} targetCwd=${targetCwd} folderName=${folderName} pinnedSize=${ctx.pinnedSessionIds ? ctx.pinnedSessionIds.size : "N/A"}\n`); } catch {}
-
-    // Encode message as base64 UTF-16LE so it survives embedding in the PS script
     const msgB64 = Buffer.from(msg, "utf16le").toString("base64");
-
-    // Route by editor (if known) then fall back to window-title search (original approach).
     const ps = `
 $text = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String("${msgB64}"))
-$editor = "${targetEditor}"
-$folderName = "${folderName}"
-$terminalPid = ${targetSourcePid}
-$dbg = "$env:APPDATA\\clawd-on-desk\\clawd-ps-debug.log"
-
-Add-Type @"
-using System;
-using System.Text;
-using System.Runtime.InteropServices;
-public class WinSend {
-  const uint WM_CHAR    = 0x0102;
-  const uint WM_KEYDOWN = 0x0100;
-  const uint WM_KEYUP   = 0x0101;
-  const int  VK_RETURN  = 0x0D;
-
-  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
-  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
-  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
-  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
-  [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
-  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-  [DllImport("user32.dll")] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
-  [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
-  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsDelegate cb, IntPtr lp);
-  [DllImport("user32.dll")] public static extern IntPtr FindWindowEx(IntPtr p, IntPtr a, string c, string t);
-  [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte sc, uint fl, UIntPtr ei);
-  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, ref int lpdwProcessId);
-  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint from, uint to, bool attach);
-  [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
-  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-  public delegate bool EnumWindowsDelegate(IntPtr h, IntPtr lp);
-
-  // Find the Chromium render widget child — direct target for WM_CHAR injection
-  public static IntPtr FindRenderWidget(IntPtr parent) {
-    IntPtr rw = FindWindowEx(parent, IntPtr.Zero, "Chrome_RenderWidgetHostHWND", null);
-    if (rw != IntPtr.Zero) return rw;
-    IntPtr child = FindWindowEx(parent, IntPtr.Zero, "Chrome_WidgetWin_1", null);
-    if (child != IntPtr.Zero) {
-      rw = FindWindowEx(child, IntPtr.Zero, "Chrome_RenderWidgetHostHWND", null);
-      if (rw != IntPtr.Zero) return rw;
-    }
-    return parent;
-  }
-
-  // Find Claude Desktop: Chrome_WidgetWin_1 with title "Claude"
-  public static IntPtr FindClaudeDesktop() {
-    IntPtr found = IntPtr.Zero;
-    EnumWindows((h, _) => {
-      if (!IsWindowVisible(h) && !IsIconic(h)) return true;
-      var cls = new StringBuilder(256); GetClassName(h, cls, 256);
-      var ttl = new StringBuilder(256); GetWindowText(h, ttl, 256);
-      string t = ttl.ToString();
-      if (cls.ToString() == "Chrome_WidgetWin_1" && (t == "Claude" || t.EndsWith("— Claude") || t.EndsWith("- Claude"))) { found = h; return false; }
-      return true;
-    }, IntPtr.Zero);
-    return found;
-  }
-
-  // Find first visible terminal/editor window whose title contains folderName.
-  // Excludes file explorers (CabinetWClass, ExploreWClass) and system windows.
-  public static IntPtr FindWindowByTitle(string folderName) {
-    IntPtr found = IntPtr.Zero;
-    EnumWindows((h, _) => {
-      if (!IsWindowVisible(h) && !IsIconic(h)) return true;
-      var cls = new StringBuilder(128); GetClassName(h, cls, 128);
-      string c = cls.ToString();
-      // Skip file explorer, task manager, tray, etc.
-      if (c == "CabinetWClass" || c == "ExploreWClass" || c == "WorkerW" ||
-          c == "Shell_TrayWnd" || c == "Progman") return true;
-      var ttl = new StringBuilder(512); GetWindowText(h, ttl, 512);
-      string t = ttl.ToString();
-      if (t.Length == 0 || t == "Claude" || t == "Clawd") return true;
-      if (t.IndexOf(folderName, StringComparison.OrdinalIgnoreCase) >= 0) { found = h; return false; }
-      return true;
-    }, IntPtr.Zero);
-    return found;
-  }
-
-  // Robustly focus a window using AttachThreadInput so keyboard input
-  // actually transfers even from a background/hidden process.
-  public static void FocusWindow(IntPtr h) {
-    if (h == IntPtr.Zero) return;
-    if (IsIconic(h)) { ShowWindow(h, 9); System.Threading.Thread.Sleep(200); }
-    int dummy = 0;
-    uint targetTid = GetWindowThreadProcessId(h, ref dummy);
-    uint myTid = GetCurrentThreadId();
-    keybd_event(0x12, 0, 0, UIntPtr.Zero);
-    keybd_event(0x12, 0, 2, UIntPtr.Zero);
-    SetForegroundWindow(h);
-    BringWindowToTop(h);
-    if (targetTid != 0 && targetTid != myTid) {
-      AttachThreadInput(myTid, targetTid, true);
-      SetFocus(h);
-      AttachThreadInput(myTid, targetTid, false);
-    }
-  }
-
-  // For Electron/Chrome apps: focus the render widget child so keystrokes
-  // land in the web content (terminal pane) rather than the chrome frame.
-  public static void FocusRenderWidget(IntPtr parent) {
-    IntPtr rw = FindRenderWidget(parent);
-    if (rw == IntPtr.Zero || rw == parent) return;
-    int dummy = 0;
-    uint rwTid = GetWindowThreadProcessId(rw, ref dummy);
-    uint myTid = GetCurrentThreadId();
-    if (rwTid != 0 && rwTid != myTid) {
-      AttachThreadInput(myTid, rwTid, true);
-      SetFocus(rw);
-      AttachThreadInput(myTid, rwTid, false);
-    }
-  }
-
-  [StructLayout(LayoutKind.Sequential)]
-  public struct RECT { public int Left, Top, Right, Bottom; }
-  [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, ref RECT r);
-  [DllImport("user32.dll")] public static extern bool ScreenToClient(IntPtr h, ref POINT p);
-  public struct POINT { public int X; public int Y; }
-
-  // Ghost-click at absolute screen coordinates — converts to client coords, uses PostMessage, no cursor movement.
-  public static void GhostClickAbsolute(IntPtr h, int screenX, int screenY) {
-    if (h == IntPtr.Zero) return;
-    IntPtr rw = FindRenderWidget(h);
-    IntPtr target = (rw != IntPtr.Zero) ? rw : h;
-    POINT pt = new POINT { X = screenX, Y = screenY };
-    ScreenToClient(target, ref pt);
-    IntPtr lp = (IntPtr)(((pt.Y & 0xFFFF) << 16) | (pt.X & 0xFFFF));
-    PostMessage(target, 0x0201, (IntPtr)1, lp); // WM_LBUTTONDOWN
-    System.Threading.Thread.Sleep(20);
-    PostMessage(target, 0x0202, (IntPtr)0, lp); // WM_LBUTTONUP
-  }
-
-  // Click near the bottom-center using PostMessage — no cursor movement.
-  public static void ClickWindow(IntPtr h) {
-    if (h == IntPtr.Zero) return;
-    IntPtr rw = FindRenderWidget(h);
-    IntPtr target = (rw != IntPtr.Zero) ? rw : h;
-    RECT r = new RECT();
-    if (!GetClientRect(target, ref r)) return;
-    int cx = (r.Left + r.Right) / 2;
-    int cy = r.Top + (int)((r.Bottom - r.Top) * 0.92);
-    IntPtr lp = (IntPtr)(((cy & 0xFFFF) << 16) | (cx & 0xFFFF));
-    PostMessage(target, 0x0201, (IntPtr)1, lp); // WM_LBUTTONDOWN
-    System.Threading.Thread.Sleep(20);
-    PostMessage(target, 0x0202, (IntPtr)0, lp); // WM_LBUTTONUP
-  }
-
-  // Ghost-click at relative percentages within the window — no cursor movement.
-  public static void GhostClickRelative(IntPtr h, double pctX, double pctY) {
-    if (h == IntPtr.Zero) return;
-    IntPtr rw = FindRenderWidget(h);
-    IntPtr target = (rw != IntPtr.Zero) ? rw : h;
-    RECT r = new RECT();
-    if (!GetClientRect(target, ref r)) return;
-    int cx = r.Left + (int)((r.Right  - r.Left) * pctX);
-    int cy = r.Top  + (int)((r.Bottom - r.Top)  * pctY);
-    IntPtr lp = (IntPtr)(((cy & 0xFFFF) << 16) | (cx & 0xFFFF));
-    PostMessage(target, 0x0201, (IntPtr)1, lp);
-    System.Threading.Thread.Sleep(20);
-    PostMessage(target, 0x0202, (IntPtr)0, lp);
-  }
-
-  // Click ~10px from the right edge of the MAIN window, vertically centered — no cursor movement.
-  // Uses the main window rect for coordinates so the position is always near the true right border.
-  public static void ClickWindowNearRight(IntPtr h) {
-    if (h == IntPtr.Zero) return;
-    RECT r = new RECT();
-    if (!GetClientRect(h, ref r)) return;
-    int cx = r.Left + (int)((r.Right - r.Left) * 0.93);
-    int cy = (r.Top + r.Bottom) / 2;
-    IntPtr lp = (IntPtr)(((cy & 0xFFFF) << 16) | (cx & 0xFFFF));
-    PostMessage(h, 0x0201, (IntPtr)1, lp); // WM_LBUTTONDOWN
-    System.Threading.Thread.Sleep(20);
-    PostMessage(h, 0x0202, (IntPtr)0, lp); // WM_LBUTTONUP
-  }
-
-  // Click at 92% (maximized) or 88% (windowed) down the main window, horizontally centered — no cursor movement.
-  // Used for Claude Desktop to land in the chat input area.
-  public static void ClickWindowBottom(IntPtr h) {
-    if (h == IntPtr.Zero) return;
-    RECT r = new RECT();
-    if (!GetClientRect(h, ref r)) return;
-    double pct = IsZoomed(h) ? 0.92 : 0.88;
-    int cx = r.Left + (int)((r.Right - r.Left) * 0.25);
-    int cy = r.Top + (int)((r.Bottom - r.Top) * pct);
-    IntPtr lp = (IntPtr)(((cy & 0xFFFF) << 16) | (cx & 0xFFFF));
-    PostMessage(h, 0x0201, (IntPtr)1, lp); // WM_LBUTTONDOWN
-    System.Threading.Thread.Sleep(20);
-    PostMessage(h, 0x0202, (IntPtr)0, lp); // WM_LBUTTONUP
-  }
-
-  // Click at 89% down the main window, horizontally centered — no cursor movement.
-  // Used for Antigravity to land in the terminal pane.
-  public static void ClickWindowBottom85(IntPtr h) {
-    if (h == IntPtr.Zero) return;
-    RECT r = new RECT();
-    if (!GetClientRect(h, ref r)) return;
-    int cx = (r.Left + r.Right) / 2;
-    int cy = r.Top + (int)((r.Bottom - r.Top) * 0.89);
-    IntPtr lp = (IntPtr)(((cy & 0xFFFF) << 16) | (cx & 0xFFFF));
-    PostMessage(h, 0x0201, (IntPtr)1, lp); // WM_LBUTTONDOWN
-    System.Threading.Thread.Sleep(20);
-    PostMessage(h, 0x0202, (IntPtr)0, lp); // WM_LBUTTONUP
-  }
-}
-"@
 Add-Type -AssemblyName System.Windows.Forms
-
-$target = [IntPtr]::Zero
-$log = @()
-Add-Content $dbg "[$(Get-Date -f o)] PS-START editor=$editor folder=$folderName"
-
-# ── Pass 1: Editor-based routing (exact, no ambiguity) ──────────────────────
-if ($editor -ne "") {
-  switch ($editor) {
-    "antigravity" {
-      $procs = Get-Process -Name antigravity -EA 0 | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero }
-      $match = if ($folderName -ne "") { $procs | Where-Object { $_.MainWindowTitle -like "*$folderName*" } | Select-Object -First 1 } else { $null }
-      if (-not $match) { $match = $procs | Select-Object -First 1 }
-      if ($match) { $target = $match.MainWindowHandle }
-      $log += "ag=$target"
-    }
-    "obsidian" {
-      $match = Get-Process -Name obsidian -EA 0 | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } | Select-Object -First 1
-      if ($match) { $target = $match.MainWindowHandle }
-      $log += "ob=$target"
-    }
-    "claude" {
-      $target = [WinSend]::FindClaudeDesktop()
-      $log += "claude=$target"
-    }
-    "cmd" {
-      if ($terminalPid -gt 0) {
-        $p = Get-Process -Id $terminalPid -EA 0
-        if ($p -and $p.MainWindowHandle -ne [IntPtr]::Zero) { $target = $p.MainWindowHandle }
-      }
-      if ($target -eq [IntPtr]::Zero) {
-        $p = Get-Process -Name powershell -EA 0 | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } | Select-Object -First 1
-        if ($p) { $target = $p.MainWindowHandle }
-      }
-      if ($target -eq [IntPtr]::Zero) {
-        $p = Get-Process -Name cmd -EA 0 | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } | Select-Object -First 1
-        if ($p) { $target = $p.MainWindowHandle }
-      }
-      $log += "psh=$target"
-    }
-  }
-}
-
-# ── Pass 2: Title-search fallback (original behaviour) ──────────────────────
-if ($target -eq [IntPtr]::Zero) {
-  if ($folderName -ne "") {
-    $target = [WinSend]::FindWindowByTitle($folderName)
-    $log += "title($folderName)=$target"
-  }
-  if ($target -eq [IntPtr]::Zero) {
-    $target = [WinSend]::FindClaudeDesktop()
-    $log += "cd-fallback=$target"
-  }
-}
-
-Add-Content $dbg "[$(Get-Date -f o)] $($log -join ' | ') => $target"
-
 [System.Windows.Forms.Clipboard]::SetText($text)
-$wasMinimized = $false
-if ($target -ne [IntPtr]::Zero) {
-  # Flash mode: if window was minimized, restore → paste → re-minimize for all editors
-  if ([WinSend]::IsIconic($target)) {
-    $wasMinimized = $true
-  }
-  [WinSend]::FocusWindow($target)
-  # For Electron/Chrome apps, also move focus into the render widget (terminal pane)
-  if ($editor -eq "antigravity" -or $editor -eq "obsidian") {
-    Start-Sleep -Milliseconds 150
-    [WinSend]::FocusRenderWidget($target)
-  }
-  # Antigravity: ghost-click at 85% down to land focus in terminal pane
-  if ($editor -eq "antigravity") {
-    Start-Sleep -Milliseconds 100
-    [WinSend]::ClickWindowBottom85($target)
-  }
-  # Obsidian: ghost-click at 92.7% from left, 87.1% down (terminal pane)
-  if ($editor -eq "obsidian") {
-    Start-Sleep -Milliseconds 100
-    [WinSend]::GhostClickRelative($target, 0.927, 0.871)
-  }
-  # Claude Desktop: ghost-click at 21.8% from left, 92.3% down (chat input area)
-  if ($editor -eq "claude") {
-    Start-Sleep -Milliseconds 100
-    [WinSend]::GhostClickRelative($target, 0.340, 0.930)
-  }
-  Start-Sleep -Milliseconds 275
-}
-# Paste using the correct shortcut for each app type
-if ($editor -eq "cmd") {
-  [System.Windows.Forms.SendKeys]::SendWait("^+v{ENTER}")
-} else {
-  [System.Windows.Forms.SendKeys]::SendWait("^v{ENTER}")
-}
-# Flash: re-minimize if it was minimized before we restored it
-if ($wasMinimized) {
-  Start-Sleep -Milliseconds 275
-  [WinSend]::ShowWindow($target, 6)
-}
+[System.Windows.Forms.SendKeys]::SendWait("^v{ENTER}")
 `;
-    // Grant PS process permission to steal foreground focus
     if (ctx.allowAnyForeground) ctx.allowAnyForeground();
-    const _psLogPath = require("path").join(require("os").homedir(), "AppData", "Roaming", "clawd-on-desk", "clawd-chat-debug.log");
-    execFile("powershell", ["-NoProfile", "-NonInteractive", "-Command", ps],
-      { windowsHide: true },
-      (err, stdout, stderr) => {
-        const result = `exitCode=${err ? (err.code || 1) : 0} stderr=${(stderr||"").trim().slice(0,200)} stdout=${(stdout||"").trim().slice(0,100)}`;
-        try { require("fs").appendFileSync(_psLogPath, `[${new Date().toISOString()}] PS-RESULT: ${result}\n`); } catch {}
-        if (err) console.error("Clawd chat send error:", stderr || err.message);
-      }
-    );
+    execFile("powershell", ["-NoProfile", "-NonInteractive", "-Command", ps], { windowsHide: true }, () => {});
   } else if (isMac && ctx.focusTerminalWindow) {
     let bestPid = null, bestCwd = null, bestEditor = null, bestChain = null;
     if (ctx.sessions) {
-      const pinned = ctx.pinnedSessionIds;
-      const hasPins = pinned && pinned.size > 0;
       let latest = 0;
       for (const [id, s] of ctx.sessions) {
-        // If sessions are pinned, only consider pinned ones
         if (hasPins && !pinned.has(id)) continue;
         if (s.sourcePid && (s.updatedAt || 0) >= latest) {
           latest = s.updatedAt || 0;
-          bestPid = s.sourcePid; bestCwd = s.cwd;
-          bestEditor = s.editor; bestChain = s.pidChain;
+          bestPid = s.sourcePid; bestCwd = s.cwd; bestEditor = s.editor; bestChain = s.pidChain;
         }
       }
     }
@@ -476,114 +412,57 @@ if ($wasMinimized) {
   }
 }
 
-function getSessionInfo() {
-  const pinned  = ctx.pinnedSessionIds;
-  const hasPins = pinned && pinned.size > 0;
-  let sid = null, editor = "";
-  let latest = 0;
-  if (ctx.sessions) {
-    for (const [id, s] of ctx.sessions) {
-      if (hasPins && !pinned.has(id)) continue;
-      if ((s.updatedAt || 0) >= latest) {
-        latest = s.updatedAt || 0;
-        sid    = id;
-        editor = s.editor || "";
-      }
-    }
-  }
-  const name  = (sid && ctx.sessionNames && ctx.sessionNames[sid]) || "Clawd";
-  const color = EDITOR_COLOR[editor] || DEFAULT_COLOR;
-  return { name, color };
-}
-
-function show() {
-  if (chatWin && !chatWin.isDestroyed()) {
-    reposition();
-    chatWin.webContents.send("chat-show", getSessionInfo());
-    return;
-  }
-
-  const { x, y } = getPosition();
-  chatWin = new BrowserWindow({
-    width: BUBBLE_W,
-    height: BUBBLE_H,
-    x, y,
-    show: false,
-    frame: false,
-    transparent: true,
-    alwaysOnTop: true,
-    resizable: false,
-    skipTaskbar: true,
-    hasShadow: false,
-    focusable: true,   // Chat bubble needs focus for typing
-    ...(isLinux ? { type: LINUX_WINDOW_TYPE } : {}),
-    ...(isMac ? { type: "panel" } : {}),
-    webPreferences: {
-      preload: path.join(__dirname, "preload-chat-bubble.js"),
-      nodeIntegration: false,
-      contextIsolation: true,
-    },
-  });
-
-  if (isWin) chatWin.setAlwaysOnTop(true, WIN_TOPMOST_LEVEL);
-
-  chatWin.loadFile(path.join(__dirname, "chat-bubble.html"));
-
-  chatWin.webContents.once("did-finish-load", () => {
-    chatWin.webContents.send("chat-show", getSessionInfo());
-    reposition();
-    chatWin.show();
-    chatWin.focus();
-    // Freeze Clawd while chat bubble is open
-    if (ctx.freezeFollower) ctx.freezeFollower();
-  });
-
-  chatWin.on("blur", () => {
-    // Close when user clicks away
-    setTimeout(() => {
-      if (chatWin && !chatWin.isDestroyed() && !chatWin.isFocused()) {
-        hide();
-      }
-    }, 150);
-  });
-
-  chatWin.on("closed", () => {
-    chatWin = null;
-    // Only unfreeze if: not suppressed by this close, AND not in a manual freeze
-    if (!suppressUnfreeze && !manuallyFrozen && ctx.unfreezeFollower) ctx.unfreezeFollower();
-    suppressUnfreeze = false;
-  });
-}
-
-function hide() {
-  if (!chatWin || chatWin.isDestroyed()) return;
-  chatWin.webContents.send("chat-hide");
-  setTimeout(() => {
-    if (chatWin && !chatWin.isDestroyed()) chatWin.close();
-  }, 350); // let fade-out animation play
-}
+// ── IPC ─────────────────────────────────────────────────────────────────────
 
 function registerIpc() {
   if (ipcRegistered) return;
   ipcRegistered = true;
 
-  ipcMain.on("chat-send", (_, msg) => {
-    sendMessage(msg); // hide() is called inside sendMessage
+  ipcMain.on("chat-send", (event, msg) => {
+    const terminalId = findTerminalBySender(event.sender);
+    sendMessage(msg, terminalId);
   });
 
-  ipcMain.on("chat-close", () => hide());
+  ipcMain.on("chat-close", (event) => {
+    const terminalId = findTerminalBySender(event.sender);
+    if (terminalId) hide(terminalId);
+  });
 
-  ipcMain.on("chat-height", (_, h) => {
-    measuredH = h;
-    reposition();
+  ipcMain.on("chat-height", (event, h) => {
+    const terminalId = findTerminalBySender(event.sender);
+    if (!terminalId) return;
+    winHeight.set(terminalId, h);
+    repositionTerminal(terminalId);
   });
 }
+
+// ── Public API ───────────────────────────────────────────────────────────────
 
 function cleanup() {
-  if (chatWin && !chatWin.isDestroyed()) chatWin.close();
-  chatWin = null;
+  for (const [, win] of chatWins) {
+    if (win && !win.isDestroyed()) win.close();
+  }
+  chatWins.clear();
+  winHeight.clear();
 }
 
-return { show, hide, registerIpc, cleanup };
+function pushSessionUpdate(terminalId) {
+  if (terminalId) {
+    // Update specific terminal's window
+    const win = chatWins.get(terminalId);
+    if (win && !win.isDestroyed()) {
+      win.webContents.send("chat-session-update", getSessionInfoForTerminal(terminalId));
+    }
+  } else {
+    // Update all open windows
+    for (const [tid, win] of chatWins) {
+      if (win && !win.isDestroyed()) {
+        win.webContents.send("chat-session-update", getSessionInfoForTerminal(tid));
+      }
+    }
+  }
+}
+
+return { show, hide, registerIpc, cleanup, pushSessionUpdate, reposition };
 
 };

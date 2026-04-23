@@ -618,6 +618,16 @@ const { setState, applyState, updateSession, resolveDisplayState, getSvgOverride
 const sessions = _state.sessions;
 const STATE_PRIORITY = _state.STATE_PRIORITY;
 
+// ── CLAWD-BOT Terminal Manager — defined here, initialized after pinnedSessionIds ──
+const { initTerminalManager } = require("./terminal-manager");
+const _termCtx = {
+  sessions,
+  get pinnedSessionIds() { return pinnedSessionIds; },
+  get rebuildAllMenus()  { try { return rebuildAllMenus; } catch (_) { return null; } },
+  resolveDisplayState: () => _state && _state.resolveDisplayState && _state.resolveDisplayState(),
+};
+// NOTE: initTerminalManager(_termCtx) is called AFTER pinnedSessionIds is declared (below)
+
 // ── Hit-test: SVG bounding box → screen coordinates ──
 function getHitRectScreen(bounds) {
   const state = _state.getCurrentState();
@@ -702,6 +712,12 @@ const _chatCtx = {
       try { _allowSetForeground(-1); } catch {}
     }
   },
+  get terminalManager() { return _termCtx.terminalManager; },
+};
+
+// Wire pushSessionUpdate into _termCtx so renaming a terminal live-updates the bubble
+_termCtx.pushSessionUpdate = () => {
+  if (_chat && _chat.pushSessionUpdate) _chat.pushSessionUpdate();
 };
 const _chat = require("./chat")(_chatCtx);
 
@@ -712,6 +728,9 @@ const _responseMulti = require("./response-multi")({
   get sessionNames() { return sessionNames; },
   getNearestWorkArea: (x, y) => getNearestWorkArea(x, y),
 });
+
+// Wire showResponse into _chatCtx so chat.js can call it
+_chatCtx.showResponse = (text, sid) => _responseMulti.show(text, sid);
 
 // ── Session picker bubble (Shift+Right-click) ──
 const _sessionPicker = require("./session-picker")({
@@ -731,6 +750,11 @@ const _sessionPicker = require("./session-picker")({
     if (name && name.trim()) sessionNames[id] = name.trim();
     else delete sessionNames[id];
     _saveSessionNames();
+    // If this is a CLAWD-BOT terminal session, keep the terminal name in sync too
+    const tm = _termCtx && _termCtx.terminalManager;
+    if (tm && tm.TERMINAL_IDS.includes(id)) {
+      tm.renameTerminal(id, name && name.trim() ? name.trim() : null);
+    }
   },
 });
 
@@ -781,6 +805,9 @@ const { ids: _loadedPinnedIds, cwds: _loadedPinnedCwds } = _loadPinnedSessions()
 const pinnedSessionIds = new Set(_loadedPinnedIds);
 const pinnedSessionCwds = { ..._loadedPinnedCwds }; // id -> cwd, updated when sessions register
 
+// ── CLAWD-BOT Terminal Manager init (needs pinnedSessionIds) ────────────
+initTerminalManager(_termCtx);
+
 // ── Session custom names — persisted display labels (id → string) ──
 const SESSION_NAMES_PATH = path.join(app.getPath("userData"), "clawd-session-names.json");
 function _loadSessionNames() {
@@ -793,6 +820,11 @@ function _saveSessionNames() {
   try { require("fs").writeFileSync(SESSION_NAMES_PATH, JSON.stringify(sessionNames)); } catch {}
 }
 const sessionNames = _loadSessionNames();
+// Always boot terminal slots with default names — never show raw IDs like "t1"
+sessionNames["t1"] = "Terminal 1";
+sessionNames["t2"] = "Terminal 2";
+sessionNames["t3"] = "Terminal 3";
+sessionNames["t4"] = "Terminal 4";
 
 // ── Selected sessions — the cycling pool for Ctrl+Right-click ──
 // Separate from pinnedSessionIds. User picks which sessions to include in the
@@ -1075,7 +1107,9 @@ const _menuCtx = {
   getActiveThemeId: () => activeTheme ? activeTheme._id : "clawd",
   ensureUserThemesDir: () => themeLoader.ensureUserThemesDir(),
   openSettingsWindow: () => openSettingsWindow(),
+  get pinnedSessionIds() { return pinnedSessionIds; },
 };
+
 const _menu = require("./menu")(_menuCtx);
 const { t, buildContextMenu, buildTrayMenu, rebuildAllMenus, createTray,
         destroyTray, showPetContextMenu, popupMenuAt, ensureContextMenuOwner,
@@ -1587,6 +1621,44 @@ ipcMain.handle("settings:confirm-disconnect-claude-hooks", async (event) => {
   }
 });
 
+// ── CLAWD-BOT Terminal IPC ───────────────────────────────────────────────
+ipcMain.handle("clawd:list-terminals", () => {
+  const tm = _termCtx.terminalManager;
+  if (!tm) return [];
+  return tm.getTerminals().map(t => ({
+    id:     t.id,
+    name:   t.name,
+    color:  t.color,
+    busy:   t.busy,
+    state:  t.state,
+    active: t.id === tm.getActiveId(),
+  }));
+});
+
+ipcMain.handle("clawd:set-active-terminal", (_event, id) => {
+  const tm = _termCtx.terminalManager;
+  if (tm) tm.setActiveTerminal(id);
+  return { ok: true };
+});
+
+ipcMain.handle("clawd:rename-terminal", (_event, id, name) => {
+  const tm = _termCtx.terminalManager;
+  if (tm) tm.renameTerminal(id, name);
+  // Keep sessionNames in sync so response bubbles, menus, etc. all show the same name
+  if (name && name.trim()) sessionNames[id] = name.trim();
+  else delete sessionNames[id];
+  _saveSessionNames();
+  // Update just that terminal's chat window header (if open)
+  if (_chat && _chat.pushSessionUpdate) _chat.pushSessionUpdate(id);
+  return { ok: true };
+});
+
+ipcMain.handle("clawd:clear-terminal-history", (_event, id) => {
+  const tm = _termCtx.terminalManager;
+  if (tm) tm.clearHistory(id);
+  return { ok: true };
+});
+
 ipcMain.handle("settings:list-sessions", () => {
   const result = [];
   const seenIds = new Set();
@@ -1603,6 +1675,7 @@ ipcMain.handle("settings:list-sessions", () => {
       pinned: pinnedSessionIds.has(id),
       selected: selectedSessionIds.has(id),
       offline: false,
+      clawdBot: !!s.clawdBot,
     });
   }
   // Also include pinned sessions that have been cleaned from the Map (offline)
@@ -2361,7 +2434,7 @@ function createWindow() {
     hitWin.loadFile(path.join(__dirname, "hit.html"));
     if (isWin) guardAlwaysOnTop(hitWin);
 
-    // Event-level safety net for position sync
+    // Event-level safety net for position sync — immediate follow
     const syncFloatingWindows = () => {
       syncHitWin();
       if (bubbleFollowPet) repositionFloatingBubbles();
@@ -2896,6 +2969,8 @@ if (!gotTheLock) {
 
   app.on("before-quit", () => {
     isQuitting = true;
+    // Kill all in-flight CLAWD-BOT terminal claude processes
+    if (_termCtx.terminalManager) _termCtx.terminalManager.killAll();
     flushRuntimeStateToPrefs();
     unregisterToggleShortcut();
     globalShortcut.unregisterAll();
