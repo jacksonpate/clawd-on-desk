@@ -10,6 +10,7 @@ const { spawn } = require("child_process");
 const path   = require("path");
 const fs     = require("fs");
 const crypto = require("crypto");
+const tts    = require("./tts"); // ElevenLabs TTS for T3/T4 by default
 
 const CLAUDE_BIN  = "C:\\Users\\jacks\\.local\\bin\\claude.exe";
 const NAMES_FILE  = path.join(app.getPath("userData"), "clawd-terminal-names.json");
@@ -318,6 +319,8 @@ function initTerminalManager(ctx) {
       if (text) {
         t.history.push({ role: "claude", text });
         onResponse(text, null);
+        // Voice playback for opted-in terminals (default: T3, T4)
+        try { tts.speakForTerminal(t.id, text); } catch (e) { /* never block UI on TTS */ }
       } else {
         const errText = stripAnsi(stderr) || "No response from Claude.";
         onResponse(null, errText);
